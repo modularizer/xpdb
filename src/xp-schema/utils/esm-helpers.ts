@@ -1,12 +1,12 @@
 /**
  * ESM Helpers
  * 
- * Utility functions for ES module compatibility, providing CommonJS equivalents
- * like __filename and __dirname that are not available in ES modules.
+ * Node.js-only utility functions for ES module compatibility.
+ * These functions use Node.js built-in modules and will NOT work in React Native or browser.
+ * 
+ * DO NOT import this file in React Native code - it will cause bundling errors.
+ * Only use in Node.js contexts (CLI tools, generation scripts, etc.)
  */
-
-import { fileURLToPath } from 'url';
-import { dirname } from 'path';
 
 /**
  * Get the current file's path (ES module equivalent of __filename)
@@ -16,8 +16,14 @@ import { dirname } from 'path';
  * 
  * @param url - The import.meta.url from the calling file
  * @returns The absolute file path
+ * @throws Error if called in React Native or browser environments
  */
 export function getFilename(url: string | URL): string {
+  // Dynamic require - only works in Node.js
+  if (typeof require === 'undefined') {
+    throw new Error('getFilename is Node.js-only and cannot be used in React Native or browser environments');
+  }
+  const { fileURLToPath } = require('url');
   return fileURLToPath(url);
 }
 
@@ -29,8 +35,15 @@ export function getFilename(url: string | URL): string {
  * 
  * @param url - The import.meta.url from the calling file
  * @returns The absolute directory path
+ * @throws Error if called in React Native or browser environments
  */
 export function getDirname(url: string | URL): string {
+  // Dynamic require - only works in Node.js
+  if (typeof require === 'undefined') {
+    throw new Error('getDirname is Node.js-only and cannot be used in React Native or browser environments');
+  }
+  const { fileURLToPath } = require('url');
+  const { dirname } = require('path');
   return dirname(fileURLToPath(url));
 }
 
@@ -42,8 +55,15 @@ export function getDirname(url: string | URL): string {
  * 
  * @param url - The import.meta.url from the calling file
  * @returns Object with __filename and __dirname
+ * @throws Error if called in React Native or browser environments
  */
 export function getFileInfo(url: string | URL): { __filename: string; __dirname: string } {
+  // Dynamic require - only works in Node.js
+  if (typeof require === 'undefined') {
+    throw new Error('getFileInfo is Node.js-only and cannot be used in React Native or browser environments');
+  }
+  const { fileURLToPath } = require('url');
+  const { dirname } = require('path');
   const __filename = fileURLToPath(url);
   return {
     __filename,

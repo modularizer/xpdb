@@ -33,8 +33,13 @@ import {
     IndexInfo,
 } from "../types";
 import {DrizzleDatabaseConnectionDriver} from "../../drivers/types";
-import {errors} from "@ts-morph/common";
-import NotImplementedError = errors.NotImplementedError;
+// Custom error class - don't import from ts-morph (Node.js-only dependency)
+class NotImplementedError extends Error {
+  constructor(message?: string) {
+    super(message || 'Not implemented');
+    this.name = 'NotImplementedError';
+  }
+}
 import {extendDialectWithComposedBuilders} from "./composed";
 
 // ============================================================================
@@ -235,7 +240,7 @@ export class UColumn<
    * Note: Use `typeof` to access this as a type: `typeof column.$inferSelect`
    * This is a type-level property, not a runtime property.
    */
-  declare readonly $inferSelect: TType;
+  readonly $inferSelect?: TType;
   
   /**
    * Infer the insert type from this column
@@ -245,7 +250,7 @@ export class UColumn<
    * Note: Use `typeof` to access this as a type: `typeof column.$inferInsert`
    * This is a type-level property, not a runtime property.
    */
-  declare readonly $inferInsert: ComputeColumnInsertType<TType, TFlags extends { hasDefault: true } ? true : false>;
+  readonly $inferInsert?: ComputeColumnInsertType<TType, TFlags extends { hasDefault: true } ? true : false>;
 
   /**
    * Add .unique() modifier

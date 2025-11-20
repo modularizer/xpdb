@@ -1,0 +1,16 @@
+{
+  "expo": {
+    "name": "xpdb-demo",
+    "slug": "xpdb-demo",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "scheme": "xpdb",
+    "plugins": [
+      "expo-router"
+    ],
+    "web": {
+      "bundler": "metro"
+    }
+  }
+}

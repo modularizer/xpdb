@@ -33,7 +33,12 @@ export async function initializeStorage(): Promise<KeyValueStorage> {
       const { AsyncStorageDriver } = await import('./drivers/async-storage');
       currentStorage = new AsyncStorageDriver();
     } else {
-      const { FileSystemStorage } = await import('./drivers/file-system');
+      // Node.js-only - this branch should never execute in React Native
+      // Use require() directly (only called in Node.js contexts)
+      if (typeof require === 'undefined') {
+        throw new Error('FileSystemStorage requires Node.js environment');
+      }
+      const { FileSystemStorage } = require('./drivers/file-system');
       currentStorage = new FileSystemStorage();
     }
 

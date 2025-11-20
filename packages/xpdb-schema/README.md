@@ -123,10 +123,10 @@ const users = await db.users.select().where(db.users.name.eq('Alice'));
 // Update data
 await db.users.update({
   name: 'Alice Updated',
-}).where(db.users.id.eq(userId));
+}).where(eq(db.users.id, userId));
 
 // Delete data
-await db.users.delete().where(db.users.id.eq(userId));
+await db.users.delete().where(eq(db.users.id, userId));
 ```
 
 ## ES Module Support

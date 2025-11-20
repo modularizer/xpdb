@@ -14,11 +14,39 @@ export class XPDatabaseTablePlus<TTable extends Table = Table> {
         this.tableName = getTableName(this.table);
         
         // Expose columns as properties for runtime access
-        // TypeScript types are provided by the intersection type below
-        // Guard against undefined/null columns (can happen during table initialization)
+        // Drizzle bound tables expose columns as properties directly on the table object
+        // (e.g., table.id, table.name), not via table.columns
+        // We need to copy these properties to this object so db.users.id works
+        
+        // Try to get columns from table.columns first (for unbound tables)
         if (this.table.columns && typeof this.table.columns === 'object') {
             for (const [k, v] of Object.entries(this.table.columns)) {
                 (this as any)[k] = v;
+            }
+        }
+        
+        // Also copy properties directly from the table object (for bound Drizzle tables)
+        // Bound tables expose columns as properties (e.g., table.id, table.name)
+        // We need to copy these to make them accessible via db.users.id
+        const tableAny = this.table as any;
+        if (tableAny._ && tableAny._.columns) {
+            // Drizzle stores columns in table._.columns
+            for (const [k, v] of Object.entries(tableAny._.columns)) {
+                if (v && typeof v === 'object' && (v.name || v.config || v._)) {
+                    (this as any)[k] = v;
+                }
+            }
+        }
+        
+        // Also check if columns are exposed directly as properties on the table
+        // This is how Drizzle bound tables work - columns are properties like table.id
+        for (const key in tableAny) {
+            if (key !== 'columns' && key !== '_' && key !== '$inferSelect' && key !== '$inferInsert' && key !== 'getSQL') {
+                const value = tableAny[key];
+                // Check if it looks like a column (has name, config, or _ property)
+                if (value && typeof value === 'object' && (value.name || value.config || value._)) {
+                    (this as any)[key] = value;
+                }
             }
         }
     }
@@ -78,8 +106,8 @@ export class XPDatabaseTablePlus<TTable extends Table = Table> {
         return this.database.insert(this.table).values(values);
     }
 
-    update(condition: ResolvedCondition) {
-        return this.database.updateWhere(this.table, condition);
+    update() {
+        return this.database.update(this.table);
     }
 
     delete(condition: ResolvedCondition) {
@@ -91,9 +119,6 @@ export class XPDatabaseTablePlus<TTable extends Table = Table> {
 
     selectWhere(condition: ResolvedCondition, columns?: Record<string, any> | any[]): SelectQueryBuilder {
         return this.database.selectWhere(this.table, condition, columns);
-    }
-    updateWhere(condition: ResolvedCondition) {
-        return this.update(condition);
     }
 
     deleteWhere(condition: ResolvedCondition) {

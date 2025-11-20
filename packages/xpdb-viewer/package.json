@@ -45,7 +45,7 @@
     "react-native": ">=0.70.0",
     "expo-router": ">=2.0.0",
     "expo-document-picker": ">=11.0.0",
-    "drizzle-orm": "^0.29.0"
+    "drizzle-orm": "^0.44.0"
   },
   "peerDependenciesMeta": {
     "expo-router": {

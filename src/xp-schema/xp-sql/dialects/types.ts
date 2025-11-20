@@ -1,5 +1,10 @@
-import {errors} from "@ts-morph/common";
-import NotImplementedError = errors.NotImplementedError;
+// Custom error class - don't import from ts-morph (Node.js-only dependency)
+class NotImplementedError extends Error {
+  constructor(message?: string) {
+    super(message || 'Not implemented');
+    this.name = 'NotImplementedError';
+  }
+}
 import {DrizzleDatabaseConnectionDriver} from "../drivers/types";
 import type {ColumnBuilder, Table, Column} from "drizzle-orm";
 import {UColumn} from "./implementations/unbound";
@@ -335,5 +340,11 @@ export interface SQLDialect extends DialectBuilders{
         tableName: string,
         schemaName?: string
     ) => Promise<IndexInfo[]>;
+    
+    /**
+     * Get table config from a bound Drizzle table
+     * Returns the Drizzle table configuration object
+     */
+    getTableConfig: (table: Table) => any;
 }
 

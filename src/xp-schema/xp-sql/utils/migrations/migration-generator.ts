@@ -20,27 +20,9 @@ import {
   type SchemaSnapshot
 } from '../sql-generation/snapshot-sql-generator';
 import { validateSQLOrThrow } from '../../../utils/validate-sql';
-
-/**
- * Check if we're running in a Node.js environment
- */
-function isNodeEnvironment(): boolean {
-  return typeof process !== 'undefined' && 
-         process.versions != null && 
-         process.versions.node != null;
-}
-
-/**
- * Throw a helpful error if not in Node.js environment
- */
-function requireNodeEnvironment(functionName: string): void {
-  if (!isNodeEnvironment()) {
-    throw new Error(
-      `${functionName} requires a Node.js environment. ` +
-      `This function cannot be used in web browsers or other non-Node.js environments.`
-    );
-  }
-}
+// Import Node.js utilities (this file is never imported in React Native)
+// Metro is configured to ignore node-utils.ts
+import { fs, path, crypto, requireNodeEnvironment } from '../../../utils/node-utils';
 
 // In CommonJS, we can use require() directly
 // No need for getNodeRequire() workaround
@@ -123,10 +105,9 @@ export interface GenerateMigrationResult {
  */
 function loadExistingMigrations(migrationsPath: string): MigrationFile[] {
   requireNodeEnvironment('loadExistingMigrations');
-  
-  const fs = require('fs');
-  const path = require('path');
-  const crypto = require('crypto');
+  if (!fs || !path || !crypto) {
+    throw new Error('Node.js utilities not available');
+  }
   
   if (!fs.existsSync(migrationsPath)) {
     return [];
@@ -169,7 +150,10 @@ function loadExistingMigrations(migrationsPath: string): MigrationFile[] {
  * Stored directly in the dialect directory as snapshot.json
  */
 function getSnapshotPath(migrationsDir: string, dialect: string): string {
-  const path = require('path');
+  requireNodeEnvironment('function');
+  if (!path) {
+    throw new Error('Node.js utilities not available');
+  }
   return path.join(migrationsDir, dialect, 'snapshot.json');
 }
 
@@ -177,7 +161,10 @@ function getSnapshotPath(migrationsDir: string, dialect: string): string {
  * Get the path to the create script (overwritten each migration)
  */
 function getCreateScriptPath(migrationsDir: string, dialect: string): string {
-  const path = require('path');
+  requireNodeEnvironment('function');
+  if (!path) {
+    throw new Error('Node.js utilities not available');
+  }
   return path.join(migrationsDir, dialect, 'create.sql');
 }
 
@@ -185,7 +172,10 @@ function getCreateScriptPath(migrationsDir: string, dialect: string): string {
  * Get the path to a versioned schema diff JSON for a specific migration
  */
 function getVersionedDiffPath(migrationsDir: string, dialect: string, migrationName: string): string {
-  const path = require('path');
+  requireNodeEnvironment('function');
+  if (!path) {
+    throw new Error('Node.js utilities not available');
+  }
   return path.join(migrationsDir, dialect, `${migrationName}.diff.json`);
 }
 
@@ -195,7 +185,10 @@ function getVersionedDiffPath(migrationsDir: string, dialect: string, migrationN
 function loadLastSnapshot(migrationsDir: string, dialect: string): SchemaSnapshot | null {
   requireNodeEnvironment('loadLastSnapshot');
   
-  const fs = require('fs');
+  requireNodeEnvironment('loadSnapshot');
+  if (!fs) {
+    throw new Error('Node.js utilities not available');
+  }
   const snapshotPath = getSnapshotPath(migrationsDir, dialect);
   
   console.log(`🔍 Looking for snapshot at: ${snapshotPath}`);
@@ -252,9 +245,14 @@ function saveSnapshot(
 ): void {
   requireNodeEnvironment('saveSnapshot');
   
-  const fs = require('fs');
-  const path = require('path');
-  const crypto = require('crypto');
+  requireNodeEnvironment('generateMigrationFromAgnosticSchemas');
+  if (!fs || !path) {
+    throw new Error('Node.js utilities not available');
+  }
+  requireNodeEnvironment('function');
+  if (!crypto) {
+    throw new Error('Node.js utilities not available');
+  }
   
   const snapshotPath = getSnapshotPath(migrationsDir, dialect);
   const snapshotDir = path.dirname(snapshotPath);
@@ -491,9 +489,14 @@ export async function generateMigrations(
 ): Promise<GenerateMigrationResult> {
   requireNodeEnvironment('generateMigrations');
   
-  const fs = require('fs');
-  const path = require('path');
-  const crypto = require('crypto');
+  requireNodeEnvironment('generateMigrationFromAgnosticSchemas');
+  if (!fs || !path) {
+    throw new Error('Node.js utilities not available');
+  }
+  requireNodeEnvironment('function');
+  if (!crypto) {
+    throw new Error('Node.js utilities not available');
+  }
   
   const {
     migrationsDir,
@@ -621,7 +624,10 @@ export async function generateMigrations(
     
     // Calculate current schema hash after metadata extraction
     // This allows us to skip migration generation if schema hasn't actually changed
-    const crypto = require('crypto');
+    requireNodeEnvironment('function');
+  if (!crypto) {
+    throw new Error('Node.js utilities not available');
+  }
     const sortedTableNames = Object.keys(currentMetadata).sort();
     const sortedTables: Record<string, TableMetadata> = {};
     for (const tableName of sortedTableNames) {
@@ -957,8 +963,10 @@ async function loadSchemaFromFile(
 ): Promise<Schema<any>> {
   requireNodeEnvironment('loadSchemaFromFile');
   
-  const fs = require('fs');
-  const path = require('path');
+  requireNodeEnvironment('generateMigrationFromAgnosticSchemas');
+  if (!fs || !path) {
+    throw new Error('Node.js utilities not available');
+  }
   
   const schemaFilePath = path.resolve(schemaFile);
   
@@ -975,10 +983,14 @@ async function loadSchemaFromFile(
   
   let module: any;
   try {
-    module = require(modulePath);
+    // Use Function constructor to prevent Metro from statically analyzing require() calls
+    // This file should never be bundled by Metro (only loaded via require() in Node.js)
+    const requireModule = new Function('path', 'return require(path)');
+    module = requireModule(modulePath);
   } catch (error) {
     try {
-      module = require(schemaFilePath);
+      const requireModule = new Function('path', 'return require(path)');
+      module = requireModule(schemaFilePath);
     } catch (e) {
       throw new Error(
         `Failed to import module from ${schemaFilePath}. ` +
@@ -1023,7 +1035,10 @@ export async function generateMigrationsFromFile(
   // If migrationsDir is not provided, default to './migrations' relative to source file
   let resolvedMigrationsDir = migrationsDir;
   if (!resolvedMigrationsDir) {
-    const path = require('path');
+    requireNodeEnvironment('function');
+  if (!path) {
+    throw new Error('Node.js utilities not available');
+  }
     const sourceDir = path.dirname(path.resolve(sourceFile));
     resolvedMigrationsDir = path.join(sourceDir, 'migrations');
   }

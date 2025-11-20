@@ -166,7 +166,15 @@ export function getSchemaJsonFromBoundTables(
 ): Record<string, TableMetadata> {
   const metadata: Record<string, TableMetadata> = {};
   for (const [tableName, table] of Object.entries(tables)) {
-    metadata[tableName] = extractTableMetadata(table, dialect);
+    try {
+      metadata[tableName] = extractTableMetadata(table, dialect);
+    } catch (error: any) {
+      throw new Error(
+        `Failed to extract metadata for table "${tableName}": ${error.message}. ` +
+        `Table type: ${typeof table}, table keys: ${Object.keys(table || {}).slice(0, 10).join(', ')}. ` +
+        `Original error: ${error.stack || error}`
+      );
+    }
   }
   return metadata;
 }

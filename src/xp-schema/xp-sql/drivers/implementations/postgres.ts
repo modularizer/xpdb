@@ -1,44 +1,18 @@
-import postgres, { PostgresType, Options } from "postgres";
-import { drizzle } from "drizzle-orm/postgres-js";
+// Dynamic imports - these are peer dependencies that may not be installed
+// Import them inside functions to prevent Metro from analyzing them
+type PostgresType = any;
+type Options = any;
 
 import {
     connectFn,
-    DbConnectionInfo,
     DrizzleDatabaseConnectionDriver, XPDriverImpl,
 } from "../types";
+import type { PostgresConnectionInfo } from "../connection-info-types";
 import {sql} from "drizzle-orm";
 import {PlatformName} from "../../../platform";
 
-type PgCommonOptions = {
-    ssl?: boolean | object;
-    max?: number; // max connections
-    idle_timeout?: number;
-    connect_timeout?: number;
-    onnotice?: (msg: string) => void;
-};
-type PgConnectionStringConfig = PgCommonOptions & {
-    connectionString: string;
-
-    host?: never;
-    user?: never;
-    password?: never;
-    port?: never;
-    database?: never;
-};
-
-
-type PgDiscreteConfig = PgCommonOptions & {
-    connectionString?: never;
-
-    host: string;
-    user: string;
-    database: string;
-    password?: string;
-    port?: number;
-};
-
-export type PostgresConnectionInfo =
-    DbConnectionInfo & (PgConnectionStringConfig | PgDiscreteConfig);
+// Re-export the type for backward compatibility
+export type { PostgresConnectionInfo } from "../connection-info-types";
 
 function buildPostgresOptions(
     info: PostgresConnectionInfo
@@ -87,6 +61,18 @@ const driverDetails = {
 export const connectToPostgres: connectFn<PostgresConnectionInfo> = async (
     info: PostgresConnectionInfo
 ) => {
+    // Platform check - postgres driver is Node.js-only
+    if (typeof window !== 'undefined' || typeof require === 'undefined') {
+        throw new Error('Postgres driver requires Node.js environment');
+    }
+    
+    // Use require() for Node.js-only packages - use Function constructor to prevent Metro static analysis
+    // This file should never be bundled by Metro (only loaded via require() in Node.js)
+    // Using Function constructor prevents Metro from statically analyzing the require() calls
+    const postgres = new Function('return require("postgres")')();
+    const drizzleModule = new Function('return require("drizzle-orm/postgres-js")')();
+    const { drizzle } = drizzleModule;
+    
     const options = buildPostgresOptions(info);
 
     // Create postgres-js client

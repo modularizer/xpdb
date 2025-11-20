@@ -21,7 +21,9 @@ import type { TableMetadata } from '../schema-extraction/schema-diff';
 import { generateCreateScriptFromSnapshot } from '../sql-generation/snapshot-sql-generator';
 import type { SchemaSnapshot } from '../sql-generation/snapshot-sql-generator';
 import { validateSQLOrThrow } from '../../../utils/validate-sql';
-import * as crypto from 'crypto';
+// Import Node.js utilities (this file is never imported in React Native)
+// Metro is configured to ignore node-utils.ts
+import { crypto } from '../../../utils/node-utils';
 
 /**
  * Extract dialect-agnostic schema from a schema object (Step 1)
@@ -66,6 +68,9 @@ export function createSchemaSnapshot(
   }
   
   // Calculate hash of tables JSON
+  if (!crypto) {
+    throw new Error('Node.js utilities not available');
+  }
   const tablesJson = JSON.stringify(sortedTables);
   const schemaHash = crypto.createHash('sha256').update(tablesJson).digest('hex');
   

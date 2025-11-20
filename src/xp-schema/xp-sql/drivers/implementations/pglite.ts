@@ -8,7 +8,7 @@ interface QueryResultColumn {
     dataType?: string;
     nullable?: boolean;
 }
-import { drizzle } from "drizzle-orm/pglite";
+// Dynamic import - import inside function to prevent Metro from analyzing
 import {PlatformName} from "../../../platform";
 
 
@@ -64,40 +64,8 @@ async function initializePgliteResources(): Promise<void> {
                 console.log('[pglite] PGlite module imported, keys:', Object.keys(pgliteModuleCache || {}));
             }
 
-            // 2. Pre-load fsBundle as Response object
-            if (fsBundleCache === undefined) {
-                try {
-                    const response = await fetch('/pglite/pglite.data');
-                    if (response.ok) {
-                        fsBundleCache = response;
-                        console.log('[pglite] Early initialization: fsBundle loaded');
-                    } else {
-                        fsBundleCache = null; // Mark as attempted but failed
-                        console.warn('[pglite] Early initialization: Could not load fsBundle (status:', response.status, ')');
-                    }
-                } catch (error) {
-                    fsBundleCache = null; // Mark as attempted but failed
-                    console.warn('[pglite] Early initialization: Error loading fsBundle:', error);
-                }
-            }
-
-            // 3. Pre-load and compile WASM module
-            if (wasmModuleCache === undefined) {
-                try {
-                    const wasmResponse = await fetch('/pglite/pglite.wasm');
-                    if (wasmResponse.ok) {
-                        const wasmArrayBuffer = await wasmResponse.arrayBuffer();
-                        wasmModuleCache = await WebAssembly.compile(wasmArrayBuffer);
-                        console.log('[pglite] Early initialization: WASM module compiled');
-                    } else {
-                        wasmModuleCache = null; // Mark as attempted but failed
-                        console.warn('[pglite] Early initialization: Could not load WASM (status:', wasmResponse.status, ')');
-                    }
-                } catch (error) {
-                    wasmModuleCache = null; // Mark as attempted but failed
-                    console.warn('[pglite] Early initialization: Error loading WASM:', error);
-                }
-            }
+            // PGlite will load its own WASM and data files internally
+            // We don't need to pre-load them manually
 
             if (!pgliteModuleCache) {
                 throw new Error('Failed to import @electric-sql/pglite: module is undefined');
@@ -151,75 +119,35 @@ const connectToPglite: connectFn<PgliteConnectionInfo> = async ({name}: PgliteCo
         throw new Error(`Failed to find PGlite in @electric-sql/pglite module. Available exports: ${Object.keys(pgliteModuleCache).join(', ')}`);
     }
 
-    // Use cached fsBundle and wasmModule (loaded during early initialization)
-    // This avoids Metro's bundled preloaded package which has wrong size
-    // Try with wasmModule first, then add fsBundle if needed
+    // Create PGlite instance with IndexedDB for persistent storage
+    // Metro is configured to serve PGlite's WASM and data files
     let pgliteDb: any;
-    
-    // PGlite expects fsBundle as a Response object (it calls .arrayBuffer() on it internally)
-    // We MUST provide fsBundle to avoid Metro's bundled preloaded package with wrong size
-    if (wasmModuleCache) {
-        try {
-            // Fetch fsBundle as Response (PGlite expects Response, not ArrayBuffer)
-            const fsBundleResponse = await fetch('/pglite/pglite.data');
-            if (!fsBundleResponse.ok) {
-                throw new Error(`Failed to fetch fsBundle: ${fsBundleResponse.status}`);
-            }
-            
-            const options: any = {
-                wasmModule: wasmModuleCache,
-                fsBundle: fsBundleResponse, // PGlite expects Response, it will call .arrayBuffer() internally
-            };
-            console.log('[pglite] Creating PGlite with wasmModule + fsBundle (Response)');
-            console.log('[pglite] Options:', { 
-                hasWasmModule: !!options.wasmModule, 
-                hasFsBundle: !!options.fsBundle,
-                fsBundleType: options.fsBundle?.constructor?.name,
-                dataDir: `idb://${name}`
-            });
-            // Use idb://${name} format (matches old working code pattern)
-            // The pglite/ prefix might be causing filesystem issues
-            pgliteDb = new PGlite(`idb://${name}`, options);
-            console.log('[pglite] PGlite instance created, waiting for ready...');
+    try {
+        console.log('[pglite] Creating PGlite instance with IndexedDB storage...');
+        // Use idb:// prefix for IndexedDB storage (persistent)
+        const PGliteCreate = PGlite.create || pgliteModuleCache.PGlite?.create || pgliteModuleCache.default?.create;
+        if (PGliteCreate) {
+            console.log('[pglite] Using PGlite.create()');
+            pgliteDb = await PGliteCreate(`idb://${name}`);
+        } else {
+            console.log('[pglite] Using PGlite constructor');
+            pgliteDb = new PGlite(`idb://${name}`);
             await pgliteDb.waitReady;
-            console.log('[pglite] Successfully created PGlite');
-        } catch (error: any) {
-            console.error('[pglite] Error creating PGlite with wasmModule + fsBundle:', error);
-            console.error('[pglite] Error details:', {
-                name: error?.name,
-                message: error?.message,
-                errno: error?.errno,
-                stack: error?.stack
-            });
-            throw error; // Don't fall back - we need fsBundle to avoid preloaded package
         }
-    } else {
-        // Fallback: try with just fsBundle, or use PGlite.create
-        try {
-            const fsBundleResponse = await fetch('/pglite/pglite.data');
-            if (fsBundleResponse.ok) {
-                const options: any = {
-                    fsBundle: fsBundleResponse,
-                };
-                console.log('[pglite] Trying PGlite with fsBundle only');
-                pgliteDb = new PGlite(`idb://pglite/${name}`, options);
-                await pgliteDb.waitReady;
-            } else {
-                throw new Error(`Failed to fetch fsBundle: ${fsBundleResponse.status}`);
-            }
-        } catch (error) {
-            console.warn('[pglite] Error with fsBundle only, falling back to PGlite.create:', error);
-            // Final fallback
-            const PGliteCreate = pgliteModuleCache.PGlite?.create || pgliteModuleCache.default?.create;
-            if (PGliteCreate) {
-                pgliteDb = await PGliteCreate(`idb://pglite/${name}`);
-            } else {
-                pgliteDb = new PGlite(`idb://pglite/${name}`);
-                await pgliteDb.waitReady;
-            }
-        }
+        console.log('[pglite] Successfully created PGlite with IndexedDB storage');
+    } catch (error: any) {
+        console.error('[pglite] Error creating PGlite:', error);
+        console.error('[pglite] Error details:', {
+            name: error?.name,
+            message: error?.message,
+            errno: error?.errno,
+            stack: error?.stack
+        });
+        throw error;
     }
 
+    // Dynamic import to prevent Metro from analyzing
+    const { drizzle } = await import('drizzle-orm/pglite');
     const db = drizzle(pgliteDb) as any;
     db.raw = pgliteDb;
     db.connInfo = {name, dialectName: 'pg', driverName: 'pglite'};

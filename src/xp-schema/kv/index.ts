@@ -8,5 +8,5 @@ export type { KeyValueStorage } from './types';
 export { getStorage, setStorage, initializeStorage } from './factory';
 export { IndexedDBStorage } from './drivers/indexeddb';
 export { AsyncStorageDriver } from './drivers/async-storage';
-export { FileSystemStorage } from './drivers/file-system';
+// FileSystemStorage is NOT exported - it's Node.js-only and loaded dynamically in factory.ts
 

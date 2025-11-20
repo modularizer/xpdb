@@ -1,4 +1,4 @@
-import {sqliteTable, type SQLiteTableWithColumns, text as drizzleText, integer as drizzleInteger, unique, real as drizzleReal, index, customType, blob as drizzleBlob} from 'drizzle-orm/sqlite-core';
+import {sqliteTable, type SQLiteTableWithColumns, text as drizzleText, integer as drizzleInteger, unique, real as drizzleReal, index, customType, blob as drizzleBlob, getTableConfig as drizzleGetTableConfig} from 'drizzle-orm/sqlite-core';
 import {
     DialectBuilders,
     BaseDialectColumnBuilders,
@@ -682,6 +682,7 @@ const sqliteDialect: SQLDialect = {
     getTableForeignKeys,
     getTableUniqueConstraints,
     getTableIndexes,
+    getTableConfig: drizzleGetTableConfig,
 
 };
 

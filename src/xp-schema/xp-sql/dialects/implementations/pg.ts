@@ -8,7 +8,8 @@ import {
     boolean as drizzleBool,
     timestamp as drizzleTimestamp, time as drizzleTime, date as drizzleDate,
 
-    unique, index, check
+    unique, index, check,
+    getTableConfig as drizzleGetTableConfig
 } from 'drizzle-orm/pg-core';
 import {
     DialectBuilders,
@@ -577,6 +578,7 @@ const pgDialect: SQLDialect = {
     getTableForeignKeys,
     getTableUniqueConstraints,
     getTableIndexes,
+    getTableConfig: drizzleGetTableConfig,
 
 
 };

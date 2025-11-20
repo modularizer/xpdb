@@ -50,13 +50,13 @@
   },
   "dependencies": {
     "@ts-morph/common": "^0.25.0",
-    "drizzle-orm": "^0.29.0",
+    "drizzle-orm": "^0.44.0",
     "ts-morph": "^21.0.1"
   },
   "peerDependencies": {
-    "drizzle-orm": "^0.29.0",
+    "drizzle-orm": "^0.44.0",
     "expo-file-system": "^16.0.0",
-    "expo-sqlite": "^13.0.0",
+    "expo-sqlite": "^13.0.0 || ^14.0.0",
     "pglite": "^0.1.0",
     "postgres": "^3.4.0"
   },

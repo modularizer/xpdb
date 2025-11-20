@@ -21,6 +21,10 @@ import type {SQLDialect} from "../xp-sql/dialects/types";
 import {connectToDriver} from "../xp-sql/drivers/options";
 import {getDialectFromName} from "../xp-sql/dialects/options";
 import {getSchemaJsonFromBoundTables} from "../xp-sql/utils/schema-extraction/extract-schema-metadata";
+import {extractRuntimeSchemaMetadata} from "../xp-sql/utils/schema-extraction/extract-runtime-metadata";
+import {compareTables, type SchemaDiff} from "../xp-sql/utils/schema-extraction/schema-diff";
+import {generateMigrationFromSnapshotDiff, type SchemaSnapshot} from "../xp-sql/utils/sql-generation/snapshot-sql-generator";
+import {bindTable, isUTable} from "../xp-sql/dialects/implementations/unbound";
 
 
 
@@ -41,16 +45,59 @@ export type UpsertActionType = 'inserted' | 'updated' | 'unchanged';
 
 export const UpsertAction = 'upsert-action';
 
+/**
+ * Type helper to extract column properties from UTable
+ * UTable has columns as direct properties (e.g., table.id, table.name)
+ * We exclude only the known internal UTable properties
+ */
+type ExtractUTableColumns<T> = T extends { [K: string]: any }
+    ? {
+        readonly [K in keyof T as K extends 
+            'columns' | '__unbound' | '__name' | '$inferSelect' | '$inferInsert' | '$primaryKey' | 'constraints'
+            ? never 
+            : K]: T[K];
+    }
+    : {};
 
+/**
+ * Type helper to extract columns from bound Table
+ * Bound Table has columns in _['columns']
+ */
+type ExtractTableColumns<T> = T extends Table
+    ? T['_']['columns']
+    : {};
 
-export async function connect(connInfo: DbConnectionInfo, schema?: Record<string, Table> | string): Promise<XPDatabaseConnectionPlus> {
+/**
+ * Type helper to map schema tables to XPDatabaseTablePlus instances
+ * Preserves the original table types (UTable or Table) to maintain type information
+ */
+export type XPDatabaseConnectionPlusWithTables<TTables extends Record<string, Table | any> = Record<string, Table>> =
+    XPDatabaseConnectionPlus & {
+        readonly [K in keyof TTables]: XPDatabaseTablePlusWithTable<TTables[K]>;
+    };
+
+/**
+ * Type helper to create XPDatabaseTablePlus with columns from the original table type
+ * For UTable, extracts columns from the table structure itself (columns are properties)
+ * For bound Table, uses the _['columns'] structure
+ */
+type XPDatabaseTablePlusWithTable<TTable> = 
+    XPDatabaseTablePlus & 
+    (TTable extends Table
+        ? ExtractTableColumns<TTable>     // Bound Table structure
+        : ExtractUTableColumns<TTable>);   // UTable structure (everything else)
+
+export async function connect<TTables extends Record<string, Table | any> = Record<string, Table>>(
+    connInfo: DbConnectionInfo, 
+    schema?: TTables | string
+): Promise<XPDatabaseConnectionPlusWithTables<TTables>> {
     const driver = await connectToDriver(connInfo);
     const dialectName = driver.dialectName;
     const dialect = await getDialectFromName(dialectName);
-    return new XPDatabaseConnectionPlus(driver, dialect, schema);
+    return new XPDatabaseConnectionPlus(driver, dialect, schema) as XPDatabaseConnectionPlusWithTables<TTables>;
 }
 
-export class XPDatabaseConnectionPlus extends XPDatabaseConnection {
+export class XPDatabaseConnectionPlus<TTables extends Record<string, Table> = Record<string, Table>> extends XPDatabaseConnection {
     tables: Record<string, XPDatabaseTablePlus> = {};
     schema: Record<string, Table> = {};
     schemaPromise: Promise<void>;
@@ -59,24 +106,94 @@ export class XPDatabaseConnectionPlus extends XPDatabaseConnection {
     constructor(
         db: DrizzleDatabaseConnectionDriver,
         dialect: SQLDialect,
-        schema?: Record<string, Table> | string
+        schema?: TTables | string
     ) {
         super(db, dialect);
-        this.schemaPromise = this.registerSchema(schema);
+        this.schemaPromise = this.registerSchema(schema as any);
     }
 
     registerSchema(schema?: Record<string, Table> | string): Promise<void> {
         if (!schema) {
-            return this.detectRuntimeSchema().then((detectedSchema) => this.registerSchema(detectedSchema))
+            return this.detectRuntimeSchema().then((detectedSchema) => {
+                console.log('[XPDatabaseConnectionPlus] Detected runtime schema:', Object.keys(detectedSchema));
+                return this.registerSchema(detectedSchema);
+            });
         }else if (typeof schema === "string"){
-            return this.detectRuntimeSchema(schema).then((detectedSchema) => this.registerSchema(detectedSchema))
+            return this.detectRuntimeSchema(schema).then((detectedSchema) => {
+                console.log(`[XPDatabaseConnectionPlus] Detected runtime schema (${schema}):`, Object.keys(detectedSchema));
+                return this.registerSchema(detectedSchema);
+            });
         }
-        this.schema = schema;
-        for (let [tableName, table] of Object.entries(schema)) {
+        
+        // Bind all unbound tables to the dialect before storing
+        // This ensures this.schema always contains bound Drizzle tables
+        const boundSchema: Record<string, Table> = {};
+        
+        for (const [tableName, table] of Object.entries(schema)) {
+            const boundTable = bindTable(table, this.dialect);
+            
+            const config = this.dialect.getTableConfig(boundTable);
+            if (!config || !config.columns || typeof config.columns !== 'object') {
+                throw new Error(
+                    `Table "${tableName}" binding failed: getTableConfig returned invalid config. ` +
+                    `Expected config.columns to be an object, got ${typeof config?.columns}`
+                );
+            }
+            
+            boundSchema[tableName] = boundTable;
+        }
+        
+        // Store bound tables
+        this.schema = boundSchema;
+        
+        // Create XPDatabaseTablePlus wrappers for each table
+        for (let [tableName, table] of Object.entries(boundSchema)) {
             this.tables[tableName] = this.getTable(table);
             //@ts-ignore
             this[tableName] = this.getTable(table);
         }
+        
+        // After schema is registered, detect runtime schema and compare
+        this.detectRuntimeSchema().then(async (runtimeSchema) => {
+            const runtimeTableNames = Object.keys(runtimeSchema);
+            const schemaTableNames = Object.keys(boundSchema);
+            
+            console.log('[XPDatabaseConnectionPlus] Runtime schema detected:', runtimeTableNames);
+            console.log('[XPDatabaseConnectionPlus] Target schema (passed in):', schemaTableNames);
+            
+            const targetMetadata = getSchemaJsonFromBoundTables(boundSchema, this.dialect.dialectName as 'sqlite' | 'pg');
+            const liveMetadata = await extractRuntimeSchemaMetadata(this.db, this.dialect, 'public');
+            
+            const liveTableNames = new Set(Object.keys(liveMetadata));
+            const targetTableNames = new Set(Object.keys(targetMetadata));
+            
+            const diff: SchemaDiff = {
+                addedTables: Array.from(targetTableNames).filter(t => !liveTableNames.has(t)),
+                removedTables: Array.from(liveTableNames).filter(t => !targetTableNames.has(t)),
+                modifiedTables: [],
+            };
+            
+            for (const tableName of liveTableNames) {
+                if (targetTableNames.has(tableName)) {
+                    const tableDiff = compareTables(liveMetadata[tableName], targetMetadata[tableName]);
+                    if (tableDiff) {
+                        diff.modifiedTables.push(tableDiff);
+                    }
+                }
+            }
+            
+            console.log('[XPDatabaseConnectionPlus] Schema diff:', {
+                addedTables: diff.addedTables,
+                removedTables: diff.removedTables,
+                modifiedTables: diff.modifiedTables.map((t: any) => ({
+                    tableName: t.tableName,
+                    addedColumns: t.addedColumns,
+                    removedColumns: t.removedColumns,
+                    modifiedColumns: t.modifiedColumns?.map((c: any) => c.columnName),
+                })),
+            });
+        });
+        
         return Promise.resolve();
     }
     async detectRuntimeSchema(schemaName: string = 'public'): Promise<Record<string, Table>> {
@@ -92,11 +209,16 @@ export class XPDatabaseConnectionPlus extends XPDatabaseConnection {
         if (!condition) {
             return sql`true`;
         }
+        // Check if condition is already a SQL object (from drizzle-orm's eq(), and(), etc.)
+        // SQL objects have a getSQL method or _ property
+        if (condition && typeof condition === 'object' && ('getSQL' in condition || '_' in condition || 'queryChunks' in condition)) {
+            return condition as SQL;
+        }
         if (Array.isArray(condition)) {
             if (condition.length === 0) {
                 return sql`true`;
             }else if (condition.length === 1){
-                return this.buildCondition(table, condition, value);
+                return this.buildCondition(table, condition[0], value);
             }else{
                 return and(...condition.map((c: Condition) => this.buildCondition(table, c, value))) as SQL;
             }
@@ -157,11 +279,8 @@ export class XPDatabaseConnectionPlus extends XPDatabaseConnection {
      * @returns JSON-serializable schema metadata for all tables
      */
     async getSchemaJson(): Promise<Record<string, any>> {
-        // Wait for schema to be registered
         await this.schemaPromise;
-        
-        const dialectName = this.dialect.name === 'postgresql' ? 'pg' : 'sqlite';
-        return getSchemaJsonFromBoundTables(this.schema, dialectName);
+        return getSchemaJsonFromBoundTables(this.schema, this.dialect.dialectName as 'sqlite' | 'pg');
     }
     getTable<TTable extends Table>(table: TTable): XPDatabaseTablePlusWithColumns<TTable> {
         return new XPDatabaseTablePlus(this, table) as XPDatabaseTablePlusWithColumns<TTable>;
@@ -204,10 +323,7 @@ export class XPDatabaseConnectionPlus extends XPDatabaseConnection {
         const r = await this.db.select({ count: count() }).from(table).where(w);
         return r[0].count as number;
     }
-    updateWhere<T extends DrizzleTable>(table: T | any, condition: ResolvedCondition): UpdateQueryBuilder<T> {
-        const w = this.buildCondition(table, condition);
-        return this.db.update<T>(table).where(w);
-    }
+
 
     upsertWhere<T extends DrizzleTable>(table: T | any, values: Record<string, any>[], condition: UnresolvedCondition): Promise<any>;
     upsertWhere<T extends DrizzleTable>(table: T | any, value: Record<string, any>, condition: Condition): Promise<any>;
@@ -336,6 +452,200 @@ export class XPDatabaseConnectionPlus extends XPDatabaseConnection {
 
     deleteDatabase(entry: DbConnectionInfo): Promise<void> {
         return this.db.deleteDatabase(entry);
+    }
+
+    /**
+     * Check if the database schema needs migration
+     * 
+     * Compares the current runtime schema in the database with the connected schema
+     * to determine if they are identical or if migrations are needed.
+     * 
+     * @param options - Optional configuration
+     * @param options.schemaName - Schema name to check (default: 'public')
+     * @returns True if schemas are identical (no migration needed), false if migration is needed
+     * 
+     * @example
+     * ```ts
+     * const db = await schema.connect(connInfo);
+     * if (!await db.isSchemaUpToDate()) {
+     *   await db.createOrMigrate();
+     * }
+     * ```
+     */
+    async isSchemaUpToDate(options?: {
+        schemaName?: string;
+    }): Promise<boolean> {
+        const schemaName = options?.schemaName || 'public';
+
+        // Wait for schema to be registered
+        await this.schemaPromise;
+
+        if (!this.schema || Object.keys(this.schema).length === 0) {
+            const tableNames = await this.getTableNames(schemaName);
+            return tableNames.length === 0;
+        }
+
+        const targetMetadata = getSchemaJsonFromBoundTables(this.schema, this.dialect.dialectName as 'sqlite' | 'pg');
+        const liveMetadata = await extractRuntimeSchemaMetadata(this.db, this.dialect, schemaName);
+        
+        const liveTableNames = new Set(Object.keys(liveMetadata));
+        const targetTableNames = new Set(Object.keys(targetMetadata));
+        
+        const diff: SchemaDiff = {
+            addedTables: Array.from(targetTableNames).filter(t => !liveTableNames.has(t)),
+            removedTables: Array.from(liveTableNames).filter(t => !targetTableNames.has(t)),
+            modifiedTables: [],
+        };
+        
+        for (const tableName of liveTableNames) {
+            if (targetTableNames.has(tableName)) {
+                const tableDiff = compareTables(liveMetadata[tableName], targetMetadata[tableName]);
+                if (tableDiff) {
+                    diff.modifiedTables.push(tableDiff);
+                }
+            }
+        }
+
+        return diff.addedTables.length === 0 && diff.removedTables.length === 0 && diff.modifiedTables.length === 0;
+    }
+
+    /**
+     * Create or migrate the database schema
+     * 
+     * Detects the current runtime schema in the database and compares it with
+     * the connected schema. If there are differences, generates and executes
+     * the necessary migration SQL to bring the database up to date.
+     * 
+     * @param options - Optional configuration
+     * @param options.schemaName - Schema name to check (default: 'public')
+     * @param options.dryRun - If true, only return the migration SQL without executing it
+     * @returns Migration result with diff information and SQL
+     * 
+     * @example
+     * ```ts
+     * const db = await schema.connect(connInfo);
+     * if (!await db.isSchemaUpToDate()) {
+     *   await db.createOrMigrate();
+     * }
+     * ```
+     */
+    async createOrMigrate(options?: {
+        schemaName?: string;
+        dryRun?: boolean;
+    }): Promise<{
+        migrationSQL: string;
+        diff: SchemaDiff;
+        executed: boolean;
+    }> {
+        const schemaName = options?.schemaName || 'public';
+        const dryRun = options?.dryRun || false;
+
+        // Wait for schema to be registered
+        await this.schemaPromise;
+
+        // Check if schema is populated
+        if (!this.schema || Object.keys(this.schema).length === 0) {
+            throw new Error(
+                'Cannot create or migrate: schema is empty. ' +
+                'Make sure you connect with a schema that has tables defined.'
+            );
+        }
+
+        const schemaTableNames = Object.keys(this.schema);
+        if (schemaTableNames.length === 0) {
+            throw new Error('Schema has no tables to extract metadata from');
+        }
+        
+        const targetMetadata = getSchemaJsonFromBoundTables(this.schema, this.dialect.dialectName as 'sqlite' | 'pg');
+        const liveMetadata = await extractRuntimeSchemaMetadata(this.db, this.dialect, schemaName);
+
+        const liveTableNames = new Set(Object.keys(liveMetadata));
+        const targetTableNames = new Set(Object.keys(targetMetadata));
+        
+        const diff: SchemaDiff = {
+            addedTables: Array.from(targetTableNames).filter(t => !liveTableNames.has(t)),
+            removedTables: Array.from(liveTableNames).filter(t => !targetTableNames.has(t)),
+            modifiedTables: [],
+        };
+        
+        for (const tableName of liveTableNames) {
+            if (targetTableNames.has(tableName)) {
+                const tableDiff = compareTables(liveMetadata[tableName], targetMetadata[tableName]);
+                if (tableDiff) {
+                    diff.modifiedTables.push(tableDiff);
+                }
+            }
+        }
+
+        // Check if there are any differences
+        const hasChanges = 
+            diff.addedTables.length > 0 ||
+            diff.removedTables.length > 0 ||
+            diff.modifiedTables.length > 0;
+
+        if (!hasChanges) {
+            // No changes needed - database is already up to date
+            return {
+                migrationSQL: '',
+                diff,
+                executed: false,
+            };
+        }
+
+        // Create snapshots for migration generation
+        const targetSnapshot: SchemaSnapshot = {
+            version: 1,
+            timestamp: Date.now(),
+            migrationName: 'createOrMigrate',
+            tables: targetMetadata,
+            schemaHash: '',
+        };
+
+        const liveSnapshot: SchemaSnapshot = {
+            version: 1,
+            timestamp: Date.now(),
+            migrationName: 'live',
+            tables: liveMetadata,
+            schemaHash: '',
+        };
+
+        // Generate migration SQL
+        const migrationSQL = generateMigrationFromSnapshotDiff(
+            diff,
+            targetSnapshot,
+            this.dialect.dialectName as 'sqlite' | 'pg',
+            liveSnapshot
+        );
+
+        // Log migration SQL
+        if (migrationSQL.trim()) {
+            console.log('[createOrMigrate] Migration SQL:');
+            console.log(migrationSQL);
+            console.log('[createOrMigrate] End of migration SQL');
+        } else {
+            console.log('[createOrMigrate] No migration SQL generated (schema is up to date)');
+        }
+
+        // Execute migration if not dry run
+        if (!dryRun && migrationSQL.trim()) {
+            const statements = migrationSQL
+                .split(';')
+                .map(s => s.trim())
+                .filter(s => s.length > 0 && !s.match(/^\s*--/));
+
+            console.log(`[createOrMigrate] Executing ${statements.length} SQL statement(s)...`);
+            for (const statement of statements) {
+                console.log(`[createOrMigrate] Executing: ${statement.substring(0, 100)}${statement.length > 100 ? '...' : ''}`);
+                await this.execute(sql.raw(statement));
+            }
+            console.log('[createOrMigrate] Migration execution completed');
+        }
+
+        return {
+            migrationSQL,
+            diff,
+            executed: !dryRun && hasChanges,
+        };
     }
 
     /**

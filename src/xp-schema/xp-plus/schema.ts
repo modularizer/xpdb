@@ -1,7 +1,7 @@
 import {Schema} from "../xp-sql/schema";
 import {Table} from "drizzle-orm";
 import {DbConnectionInfo} from "../xp-sql/drivers/types";
-import {connect, XPDatabaseConnectionPlus} from "./database";
+import {connect, XPDatabaseConnectionPlus, XPDatabaseConnectionPlusWithTables} from "./database";
 import {UTable} from "../xp-sql/dialects";
 // Note: genTypesScript, genCreateScript, and genMigrationsScript are Node.js-only utilities
 // They are imported lazily to avoid bundling issues in web environments
@@ -36,9 +36,12 @@ export class XPSchemaPlus<Tables extends Record<string, Table | UTable<any>> = R
     async genTypesScript(anchor?: string, dst?: string) {
         const a = anchor ?? this.anchor;
         if (!a){throw new Error('must provide filename')}
-        // Lazy import to avoid bundling Node.js-only code in web environments
+        // Use require() directly (this method is only called in Node.js contexts)
+        if (typeof require === 'undefined') {
+            throw new Error('genTypesScript is only available in Node.js environments.');
+        }
         try {
-            const { genTypesScript } = await import("../utils/generate-types");
+            const { genTypesScript } = require("../utils/generate-types");
             return genTypesScript(a, dst);
         } catch (error) {
             if (typeof window !== 'undefined') {
@@ -51,8 +54,12 @@ export class XPSchemaPlus<Tables extends Record<string, Table | UTable<any>> = R
         const a = anchor ?? this.anchor;
         if (!a){throw new Error('must provide filename')}
         // Lazy import to avoid bundling Node.js-only code in web environments
+        // Use require() directly (this method is only called in Node.js contexts)
+        if (typeof require === 'undefined') {
+            throw new Error('genCreateScript is only available in Node.js environments.');
+        }
         try {
-            const { genCreateScript } = await import('../utils/generate-create-script');
+            const { genCreateScript } = require('../utils/generate-create-script');
             return genCreateScript(a, dst, dialects);
         } catch (error) {
             if (typeof window !== 'undefined') {
@@ -64,9 +71,12 @@ export class XPSchemaPlus<Tables extends Record<string, Table | UTable<any>> = R
     async genMigrationsScript(anchor?: string, dst?: string, dialects?: string[]){
         const a = anchor ?? this.anchor;
         if (!a){throw new Error('must provide filename')}
-        // Lazy import to avoid bundling Node.js-only code in web environments
+        // Use require() directly (this method is only called in Node.js contexts)
+        if (typeof require === 'undefined') {
+            throw new Error('genMigrationsScript is only available in Node.js environments.');
+        }
         try {
-            const { genMigrationsScript } = await import('../xp-sql/utils/migrations/migration-generator');
+            const { genMigrationsScript } = require('../xp-sql/utils/migrations/migration-generator');
             return genMigrationsScript(a, dst, dialects);
         } catch (error) {
             if (typeof window !== 'undefined') {
@@ -87,9 +97,11 @@ export class XPSchemaPlus<Tables extends Record<string, Table | UTable<any>> = R
         return getSchemaJsonUtil(this, dialect);
     }
 
-    async connect(connectionInfo: DbConnectionInfo): Promise<XPDatabaseConnectionPlus> {
-        const s = await this.bindByDialectName(connectionInfo.dialectName);
-        return connect(connectionInfo, s.tables);
+    async connect(connectionInfo: DbConnectionInfo): Promise<XPDatabaseConnectionPlusWithTables<Tables>> {
+        // Pass unbound schema directly - registerSchema will bind it to the correct dialect
+        // Type assertion is safe because registerSchema handles both bound and unbound tables
+        // The tables will be bound during connection, but we preserve the original types for TypeScript
+        return connect(connectionInfo, this.tables) as Promise<XPDatabaseConnectionPlusWithTables<Tables>>;
     }
 }
 

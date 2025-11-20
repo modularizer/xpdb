@@ -41,26 +41,10 @@
  * });
  * ```
  */
-/**
- * Check if we're running in a Node.js environment
- */
-function isNodeEnvironment(): boolean {
-  return typeof process !== 'undefined' && 
-         process.versions != null && 
-         process.versions.node != null;
-}
-
-/**
- * Throw a helpful error if not in Node.js environment
- */
-function requireNodeEnvironment(functionName: string): void {
-  if (!isNodeEnvironment()) {
-    throw new Error(
-      `${functionName} requires a Node.js environment. ` +
-      `This function cannot be used in web browsers or other non-Node.js environments.`
-    );
-  }
-}
+// Import Node.js utilities (this file is never imported in React Native)
+// Metro is configured to ignore node-utils.ts
+import { fs, path, requireNodeEnvironment } from './node-utils';
+import type { Project } from 'ts-morph';
 
 
 /**
@@ -184,11 +168,11 @@ async function createTempTypeFile(
 ): Promise<string> {
   requireNodeEnvironment('createTempTypeFile');
   
-  // Dynamic import for Node.js-only modules
-  const fs = await import('fs');
-  const path = await import('path');
-  const fsSync = fs.default || fs;
-  const pathSync = path.default || path;
+  if (!fs || !path) {
+    throw new Error('Node.js utilities not available');
+  }
+  const fsSync = fs;
+  const pathSync = path;
   
   const tempFilePath = pathSync.join(tempDir, 'temp-types.ts');
   const sourcePath = pathSync.resolve(sourceFile);
@@ -318,11 +302,13 @@ function extractTypes(
     const results = new Map<string, { select?: string; insert?: string }>();
     
     // Re-create temp file with type aliases for each table
-    // Dynamic import for Node.js-only modules
-    const fs = require('fs');
-    const path = require('path');
-    const fsSync = fs.default || fs;
-    const pathSync = path.default || path;
+    requireNodeEnvironment('tryGenerateTypes');
+    
+    if (!fs || !path) {
+      throw new Error('Node.js utilities not available');
+    }
+    const fsSync = fs;
+    const pathSync = path;
     
     const tempDir = pathSync.dirname(tempFilePath);
     const sourcePath = pathSync.resolve(sourceFilePath);
@@ -393,15 +379,16 @@ function extractTypes(
 export async function generateTypes(options: GenerateTypesOptions): Promise<GenerateTypesResult> {
   requireNodeEnvironment('generateTypes');
   
-  // Dynamic import for Node.js-only modules
-  const fs = await import('fs');
-  const path = await import('path');
-  const tsMorph = await import('ts-morph');
+  if (!fs || !path) {
+    throw new Error('Node.js utilities not available');
+  }
   
-  // Use default export for ESM compatibility
-  const fsSync = fs.default || fs;
-  const pathSync = path.default || path;
-  const { Project } = tsMorph.default || tsMorph;
+  // Dynamic import for ts-morph (peer dependency)
+  const tsMorph = require('ts-morph');
+  const { Project } = tsMorph;
+  
+  const fsSync = fs;
+  const pathSync = path;
   
   const {
     sourceFile,

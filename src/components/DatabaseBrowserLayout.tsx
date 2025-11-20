@@ -20,7 +20,7 @@ import {
 } from 'react-native';
 import { useLocalSearchParams } from 'expo-router';
 import {connect, getRegistryEntries, getRegistryEntry, saveRegistryEntry, createOrRetrieveRegistryEntry} from '../xp-schema';
-import type { PostgresConnectionInfo } from '../xp-schema/xp-sql/drivers/implementations/postgres';
+import type { PostgresConnectionInfo } from '../xp-schema/xp-sql/drivers/connection-info-types';
 import * as DocumentPicker from 'expo-document-picker';
 
 export type NavigateCallback = (dbName: string | null, tableName: string | null, searchParams: Record<string, string>) => void;

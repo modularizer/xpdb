@@ -274,15 +274,48 @@ export function extractTableMetadata(
   }
   
   // Fallback: extract from bound table only (original method)
+  // Validate table before processing
+  if (!table || typeof table !== 'object') {
+    throw new Error(`Invalid table: expected object, got ${typeof table}`);
+  }
+
   // Get table config using Drizzle's utility
   let getTableConfig: any;
-  if (dialect === 'pg') {
-    getTableConfig = require('drizzle-orm/pg-core').getTableConfig;
-  } else {
-    getTableConfig = require('drizzle-orm/sqlite-core').getTableConfig;
+  try {
+    if (dialect === 'pg') {
+      getTableConfig = require('drizzle-orm/pg-core').getTableConfig;
+    } else {
+      getTableConfig = require('drizzle-orm/sqlite-core').getTableConfig;
+    }
+  } catch (error: any) {
+    throw new Error(`Failed to load getTableConfig for dialect "${dialect}": ${error.message}`);
   }
   
-  const config = getTableConfig(table);
+  // Validate getTableConfig function
+  if (typeof getTableConfig !== 'function') {
+    throw new Error(`getTableConfig is not a function for dialect "${dialect}"`);
+  }
+
+  let config: any;
+  try {
+    config = getTableConfig(table);
+  } catch (error: any) {
+    const tableName = getTableName(table);
+    throw new Error(
+      `Failed to get table config for table "${tableName}": ${error.message}. ` +
+      `Table type: ${typeof table}, has columns: ${!!(table as any).columns}, ` +
+      `table keys: ${Object.keys(table || {}).join(', ')}`
+    );
+  }
+
+  // Validate config
+  if (!config || typeof config !== 'object') {
+    const tableName = getTableName(table);
+    throw new Error(
+      `getTableConfig returned invalid config for table "${tableName}": expected object, got ${typeof config}`
+    );
+  }
+
   const tableName = config.name || getTableName(table);
   
   // Debug: Log foreign keys in config
@@ -296,6 +329,15 @@ export function extractTableMetadata(
   
   // Extract columns
   const columns: Record<string, ColumnMetadata> = {};
+  
+  // Validate config.columns exists
+  if (!config.columns || typeof config.columns !== 'object') {
+    throw new Error(
+      `Table "${tableName}" has invalid columns config: expected object, got ${typeof config.columns}. ` +
+      `Config keys: ${Object.keys(config || {}).join(', ')}`
+    );
+  }
+
   const columnKeys = Array.isArray(config.columns)
     ? Object.keys(config.columns).map(k => parseInt(k)).sort((a, b) => a - b).map(k => k.toString())
     : Object.keys(config.columns);

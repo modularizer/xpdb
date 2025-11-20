@@ -7,27 +7,9 @@
  */
 
 import { generateCreateScript as generateCreateScriptFromSchema } from '../xp-sql/utils/generators/unified-generator';
-
-/**
- * Check if we're running in a Node.js environment
- */
-function isNodeEnvironment(): boolean {
-  return typeof process !== 'undefined' && 
-         process.versions != null && 
-         process.versions.node != null;
-}
-
-/**
- * Throw a helpful error if not in Node.js environment
- */
-function requireNodeEnvironment(functionName: string): void {
-  if (!isNodeEnvironment()) {
-    throw new Error(
-      `${functionName} requires a Node.js environment. ` +
-      `This function cannot be used in web browsers or other non-Node.js environments.`
-    );
-  }
-}
+// Import Node.js utilities (this file is never imported in React Native)
+// Metro is configured to ignore node-utils.ts
+import { fs, path, requireNodeEnvironment } from './node-utils';
 
 /**
  * Options for CREATE script generation
@@ -93,13 +75,11 @@ export async function generateCreateScript(
 ): Promise<GenerateCreateScriptResult> {
   requireNodeEnvironment('generateCreateScript');
   
-  // Dynamic import for Node.js-only modules
-  const fs = await import('fs');
-  const path = await import('path');
-  
-  // Use default export for fs (ESM compatibility)
-  const fsSync = fs.default || fs;
-  const pathSync = path.default || path;
+  if (!fs || !path) {
+    throw new Error('Node.js utilities not available');
+  }
+  const fsSync = fs;
+  const pathSync = path;
   
   const {
     sourceFile,
@@ -147,23 +127,30 @@ export async function generateCreateScript(
       resolvedOutputPath = pathSync.join(resolvedOutputPath, `create-script.${dialect}.sql`);
     }
   }
-  // Load the schema/table from the source file
-  const modulePath = sourceFilePath.replace(/\.ts$/, '');
+  // Load the schema/table from the source file using require (Node.js only)
+  // This file should never be bundled for React Native
+  if (typeof require === 'undefined') {
+    throw new Error('generateCreateScript requires Node.js environment with require()');
+  }
   
-  // Use dynamic import for loading the schema module
+  // Use require for loading the schema module (Node.js only)
+  // Note: This file is never imported in React Native - only loaded via require() in Node.js contexts
   let module: any;
   try {
-    module = await import(modulePath);
-  } catch (error) {
+    // Try with .js extension first (compiled output)
+    const modulePathJs = sourceFilePath.replace(/\.ts$/, '.js');
     try {
-      module = await import(sourceFilePath);
-    } catch (e) {
-      throw new Error(
-        `Failed to import module from ${sourceFilePath}. ` +
-        `Make sure the file can be executed (e.g., using tsx or ts-node). ` +
-        `Error: ${error instanceof Error ? error.message : String(error)}`
-      );
+      module = require(modulePathJs);
+    } catch {
+      // Try with original path
+      module = require(sourceFilePath);
     }
+  } catch (error) {
+    throw new Error(
+      `Failed to require module from ${sourceFilePath}. ` +
+      `Make sure the file can be executed (e.g., using tsx or ts-node). ` +
+      `Error: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
   
   const schemaOrTable = exportName === 'default' ? module.default : module[exportName];

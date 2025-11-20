@@ -1,7 +1,7 @@
 // sqlite-mobile.ts
 import * as SQLite from "expo-sqlite";
 import * as FileSystem from "expo-file-system";
-import { drizzle } from "drizzle-orm/expo-sqlite";
+// Dynamic import - import inside function to prevent Metro from analyzing
 import {
     DrizzleDatabaseConnectionDriver,
     connectFn,
@@ -42,6 +42,8 @@ const driverDetails = {
 const connectToSqliteMobile: connectFn<SqliteMobileConnectionInfo> = async (
     info: SqliteMobileConnectionInfo
 ) => {
+    // Dynamic import to prevent Metro from analyzing
+    const { drizzle } = await import('drizzle-orm/expo-sqlite');
     const expoDb = getExpoDb(info);
     const db = drizzle(expoDb) as any; // ExpoSQLiteDatabase
 

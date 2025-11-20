@@ -1,6 +1,8 @@
 import {DbConnectionInfo, DrizzleDatabaseConnectionDriver, XPDriverImpl} from "./types";
 import {SQLDialect} from "../dialects/types";
 import {getDialectFromName} from "../dialects/options";
+// Static import for pglite - it works on web/mobile and static import avoids Metro bundling issues
+import { pgliteDriver } from "./implementations/pglite";
 
 export enum XPDriverName {
     PGLITE = 'pglite',
@@ -38,12 +40,21 @@ export async function getDriverImpl<T extends DbConnectionInfo>(connInfo: T) {
 
     switch (driver) {
         case XPDriverName.PGLITE: {
-            const { pgliteDriver } = await import('./implementations/pglite');
+            // Use static import - pglite driver works on web/mobile
             return pgliteDriver as XPDriverImpl;
         }
         case XPDriverName.POSTGRES: {
-            const { postgresDriver } = await import('./implementations/postgres');
-            return postgresDriver as XPDriverImpl;
+            // Postgres is Node.js-only - use require() directly (only called in Node.js contexts)
+            if (typeof require === 'undefined') {
+                throw new Error('Postgres driver requires Node.js environment');
+            }
+            // Use Function constructor to prevent Metro from statically analyzing the require() call
+            // Construct path dynamically so Metro can't see the string literal
+            // This file is only loaded in Node.js contexts where require() bypasses Metro's resolver
+            const postgresPath = '.' + '/implementations' + '/postgres';
+            const requirePostgres = new Function('path', 'return require(path)');
+            const postgresModule = requirePostgres(postgresPath);
+            return postgresModule.postgresDriver as XPDriverImpl;
         }
         case XPDriverName.SQLITE_MOBILE: {
             const { sqliteDriver } = await import('./implementations/sqlite-mobile');
