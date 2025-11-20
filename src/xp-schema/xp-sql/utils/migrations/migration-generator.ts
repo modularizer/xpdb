@@ -19,6 +19,7 @@ import {
   generateMigrationFromSnapshotDiff,
   type SchemaSnapshot
 } from '../sql-generation/snapshot-sql-generator';
+import { validateSQLOrThrow } from '../../../utils/validate-sql';
 
 /**
  * Check if we're running in a Node.js environment
@@ -472,7 +473,14 @@ function generateMigrationSQL(
     }
   }
   
-  return statements.join('\n');
+  const sql = statements.join('\n');
+  
+  // Validate the generated migration SQL
+  if (sql.trim()) {
+    validateSQLOrThrow(sql, dialect, 'migration SQL generation');
+  }
+  
+  return sql;
 }
 
 /**

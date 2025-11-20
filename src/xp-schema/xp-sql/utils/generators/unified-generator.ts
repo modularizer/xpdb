@@ -20,6 +20,7 @@ import type { DialectAgnosticSchema, DialectAgnosticTableMetadata } from '../sch
 import type { TableMetadata } from '../schema-extraction/schema-diff';
 import { generateCreateScriptFromSnapshot } from '../sql-generation/snapshot-sql-generator';
 import type { SchemaSnapshot } from '../sql-generation/snapshot-sql-generator';
+import { validateSQLOrThrow } from '../../../utils/validate-sql';
 import * as crypto from 'crypto';
 
 /**
@@ -90,9 +91,14 @@ export async function generateCreateScriptFromAgnostic(
   const dialectSpecific = await convertToDialectSpecific(agnosticSchema, dialectObj);
   const snapshot = createSchemaSnapshot(dialectSpecific, 'create-script');
   
-  return generateCreateScriptFromSnapshot(snapshot, dialect, {
+  const sql = generateCreateScriptFromSnapshot(snapshot, dialect, {
     ifNotExists: options.ifNotExists !== false, // Default to true
   });
+  
+  // Validate the generated SQL
+  validateSQLOrThrow(sql, dialect, 'CREATE script generation');
+  
+  return sql;
 }
 
 /**

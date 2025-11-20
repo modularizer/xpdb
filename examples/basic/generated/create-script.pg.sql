@@ -2,7 +2,7 @@
 -- 
 -- This file is auto-generated. Do not edit manually.
 -- 
--- Generated at: 2025-11-20T20:13:41.037Z
+-- Generated at: 2025-11-20T20:19:36.016Z
 -- Dialect: pg
 --
 

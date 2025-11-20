@@ -10,6 +10,7 @@
 import type { TableMetadata, ColumnMetadata } from '../schema-extraction/schema-diff';
 import type { SchemaDiff } from '../schema-extraction/schema-diff';
 import { DialectSQLGenerator, SQLiteSQLGenerator, PostgreSQLSQLGenerator } from './dialect-sql-generator';
+import { validateSQLOrThrow } from '../../../utils/validate-sql';
 
 /**
  * Schema snapshot structure (matches migration-generator.ts)
@@ -370,7 +371,14 @@ export function generateCreateScriptFromSnapshot(
     }
   }
   
-  return statements.join('\n\n');
+  const sql = statements.join('\n\n');
+  
+  // Validate the generated SQL
+  if (sql.trim()) {
+    validateSQLOrThrow(sql, dialect, 'CREATE script from snapshot');
+  }
+  
+  return sql;
 }
 
 /**
@@ -714,6 +722,13 @@ export function generateMigrationFromSnapshotDiff(
     );
   }
   
-  return statements.join('\n');
+  const sql = statements.join('\n');
+  
+  // Validate the generated migration SQL
+  if (sql.trim()) {
+    validateSQLOrThrow(sql, dialect, 'migration SQL generation');
+  }
+  
+  return sql;
 }
 
