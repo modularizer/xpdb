@@ -210,26 +210,80 @@ const connectToPglite: connectFn<PgliteConnectionInfo> = async ({name}: PgliteCo
                 }
             }
             
-            // Extract ALL error properties (Drizzle/PGlite may have custom error properties)
-            const errorMsg = error?.message || String(error);
-            const errorCode = error?.code;
-            const errorDetail = error?.detail;
-            const errorHint = error?.hint;
-            const errorName = error?.name;
-            const errorErrno = error?.errno;
+            // Deep dive into error chain to find the actual database error
+            // Drizzle/PGlite often wraps the real error, so we need to dig through the chain
+            let actualError = error;
+            let errorChain: any[] = [error];
             
-            // Try to extract all enumerable properties from the error
+            // Follow the error chain (error.cause, error.originalError, etc.)
+            let current = error;
+            let depth = 0;
+            const maxDepth = 5; // Prevent infinite loops
+            while (current && depth < maxDepth) {
+                if (current.cause && current.cause !== current) {
+                    errorChain.push(current.cause);
+                    current = current.cause;
+                    depth++;
+                } else if (current.originalError && current.originalError !== current) {
+                    errorChain.push(current.originalError);
+                    current = current.originalError;
+                    depth++;
+                } else if (current.error && current.error !== current) {
+                    errorChain.push(current.error);
+                    current = current.error;
+                    depth++;
+                } else {
+                    break;
+                }
+            }
+            
+            // Find the error with the most detail (prefer one with code, detail, or hint)
+            for (const err of errorChain) {
+                if (err?.code || err?.detail || err?.hint) {
+                    actualError = err;
+                    break;
+                }
+            }
+            
+            // Extract error properties from the actual database error
+            const errorMsg = actualError?.message || error?.message || String(error);
+            const errorCode = actualError?.code || error?.code;
+            const errorDetail = actualError?.detail || error?.detail;
+            const errorHint = actualError?.hint || error?.hint;
+            const errorName = actualError?.name || error?.name;
+            const errorErrno = actualError?.errno || error?.errno;
+            
+            // Try to extract all enumerable properties from ALL errors in the chain
             const errorProps: string[] = [];
-            if (error && typeof error === 'object') {
+            const processedErrors = new Set();
+            
+            for (const err of errorChain) {
+                if (!err || typeof err !== 'object' || processedErrors.has(err)) continue;
+                processedErrors.add(err);
+                
                 try {
-                    for (const key in error) {
-                        if (error.hasOwnProperty(key) && key !== 'message' && key !== 'stack') {
-                            const value = error[key];
+                    // Extract from the error itself
+                    for (const key in err) {
+                        if (err.hasOwnProperty(key) && key !== 'message' && key !== 'stack' && key !== 'cause' && key !== 'originalError' && key !== 'error') {
+                            const value = err[key];
                             if (value !== undefined && value !== null) {
-                                errorProps.push(`${key}: ${typeof value === 'object' ? JSON.stringify(value) : String(value)}`);
+                                const valueStr = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value);
+                                errorProps.push(`${key}: ${valueStr}`);
                             }
                         }
                     }
+                    
+                    // Also check for common error property patterns
+                    if (err.severity) errorProps.push(`severity: ${err.severity}`);
+                    if (err.position) errorProps.push(`position: ${err.position}`);
+                    if (err.internalPosition) errorProps.push(`internalPosition: ${err.internalPosition}`);
+                    if (err.internalQuery) errorProps.push(`internalQuery: ${err.internalQuery}`);
+                    if (err.where) errorProps.push(`where: ${err.where}`);
+                    if (err.schema) errorProps.push(`schema: ${err.schema}`);
+                    if (err.table) errorProps.push(`table: ${err.table}`);
+                    if (err.column) errorProps.push(`column: ${err.column}`);
+                    if (err.dataType) errorProps.push(`dataType: ${err.dataType}`);
+                    if (err.constraint) errorProps.push(`constraint: ${err.constraint}`);
                 } catch (e) {
                     // Ignore errors when extracting properties
                 }
@@ -237,6 +291,27 @@ const connectToPglite: connectFn<PgliteConnectionInfo> = async ({name}: PgliteCo
             
             // Build enhanced error message with clear explanation
             let enhancedMsg = `❌ Database Error (${errorCode || 'Unknown'}): ${errorMsg}\n\n`;
+            
+            // If the error message is generic ("Failed query:"), indicate we found more details
+            if (errorMsg.startsWith('Failed query:') && (errorCode || errorDetail || errorHint)) {
+                enhancedMsg += `⚠️  Note: The error message above is generic. Found actual database error details below:\n\n`;
+            }
+            
+            // Add ALL error properties for debugging
+            if (errorProps.length > 0) {
+                enhancedMsg += `Error Properties:\n${errorProps.join('\n')}\n\n`;
+            }
+            
+            // Show error chain if there are multiple errors
+            if (errorChain.length > 1) {
+                enhancedMsg += `Error Chain (${errorChain.length} levels):\n`;
+                errorChain.forEach((err, idx) => {
+                    const msg = err?.message || String(err);
+                    const code = err?.code;
+                    enhancedMsg += `  ${idx + 1}. ${code ? `[${code}] ` : ''}${msg.substring(0, 100)}${msg.length > 100 ? '...' : ''}\n`;
+                });
+                enhancedMsg += '\n';
+            }
             
             // Add human-readable explanation for common PostgreSQL errors
             if (errorCode === '42P01') {
@@ -268,7 +343,23 @@ const connectToPglite: connectFn<PgliteConnectionInfo> = async ({name}: PgliteCo
                     if (cause.detail) enhancedMsg += `Cause Detail: ${cause.detail}\n`;
                     if (cause.hint) enhancedMsg += `Cause Hint: ${cause.hint}\n`;
                     if (cause.code) enhancedMsg += `Cause Code: ${cause.code}\n`;
+                    // Add all cause properties
+                    for (const key in cause) {
+                        if (key !== 'detail' && key !== 'hint' && key !== 'code' && cause.hasOwnProperty(key)) {
+                            const value = (cause as any)[key];
+                            if (value !== undefined && value !== null) {
+                                enhancedMsg += `Cause ${key}: ${typeof value === 'object' ? JSON.stringify(value) : String(value)}\n`;
+                            }
+                        }
+                    }
                 }
+            }
+            
+            // If error message starts with "Failed query:", it's likely from Drizzle's error handling
+            // Try to extract more information from the error object
+            if (errorMsg.startsWith('Failed query:')) {
+                enhancedMsg += `\n⚠️ Note: This error message format suggests it may be coming from Drizzle's query builder.\n`;
+                enhancedMsg += `   The actual database error might be hidden. Check error properties above for more details.\n`;
             }
             
             const enhancedError = new Error(enhancedMsg);

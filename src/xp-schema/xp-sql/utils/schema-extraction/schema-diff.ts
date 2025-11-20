@@ -183,13 +183,9 @@ function extractColumnMetadata(column: any, dialect?: 'sqlite' | 'pg'): ColumnMe
     }
   }
   
-  // Check for enum values (for both dialects)
-  if (enumValues && Array.isArray(enumValues) && enumValues.length > 0) {
-    // For enum, include the values in the type string
-    const enumStr = enumValues.map((v: any) => `'${String(v).replace(/'/g, "''")}'`).join(',');
-    const baseType = typeString.split('(')[0];
-    typeString = `${baseType}(${enumStr})`;
-  }
+  // Note: Enum values are NOT included in the type string
+  // They are handled separately via CHECK constraints in the SQL generation phase
+  // The type string should remain as the base type (e.g., VARCHAR(50), TEXT, etc.)
   
   // Extract default value for snapshot storage
   // Only store SQL expressions and literal values - skip application-level functions
@@ -493,7 +489,21 @@ export function extractTableMetadata(
         try {
           // For inline FKs, reference() returns the referenced column, not the table
           // For explicit FKs, reference() returns the referenced table
-          const refResult = fk.reference();
+          // Note: fk.reference() may trigger Drizzle's binding which can fail if column type is undefined
+          // We catch this and skip this FK - it will be handled by the inline FK extraction above
+          let refResult: any;
+          try {
+            refResult = fk.reference();
+          } catch (bindError: any) {
+            // If binding fails (e.g., "Column type undefined"), skip this FK
+            // It's likely an inline FK that was already processed above
+            if (bindError?.message?.includes('Column type') || bindError?.message?.includes('not found in dialect')) {
+              console.log(`     ⚠️  FK reference() failed during binding (likely inline FK already processed): ${bindError.message}`);
+              continue;
+            }
+            throw bindError; // Re-throw if it's a different error
+          }
+          
           console.log(`     fk.reference() returned:`, {
             type: typeof refResult,
             isNull: refResult === null,

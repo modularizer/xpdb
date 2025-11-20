@@ -22,11 +22,55 @@ export function validateSQL(sql: string, dialect: 'pg' | 'sqlite'): { valid: boo
   const parserDialect = dialect === 'pg' ? 'postgresql' : 'sqlite';
   
   // Split SQL into individual statements (semicolon-separated)
-  // Remove comments and empty statements
-  const statements = sql
-    .split(';')
-    .map(s => s.trim())
-    .filter(s => s.length > 0 && !s.startsWith('--'));
+  // Need to be careful not to split on semicolons inside string literals or parentheses
+  const statements: string[] = [];
+  let currentStatement = '';
+  let depth = 0; // Track nesting depth for parentheses
+  let inString = false;
+  let stringChar = '';
+  
+  for (let i = 0; i < sql.length; i++) {
+    const char = sql[i];
+    const nextChar = sql[i + 1];
+    
+    // Track string literals
+    if ((char === "'" || char === '"') && (i === 0 || sql[i - 1] !== '\\')) {
+      if (!inString) {
+        inString = true;
+        stringChar = char;
+      } else if (char === stringChar) {
+        inString = false;
+        stringChar = '';
+      }
+    }
+    
+    // Track parentheses depth (only when not in string)
+    if (!inString) {
+      if (char === '(') {
+        depth++;
+      } else if (char === ')') {
+        depth--;
+      }
+      
+      // Split on semicolon only when at top level (depth === 0) and not in string
+      if (char === ';' && depth === 0 && !inString) {
+        const trimmed = currentStatement.trim();
+        if (trimmed && !trimmed.startsWith('--')) {
+          statements.push(trimmed);
+        }
+        currentStatement = '';
+        continue;
+      }
+    }
+    
+    currentStatement += char;
+  }
+  
+  // Add the last statement if any
+  const trimmed = currentStatement.trim();
+  if (trimmed && !trimmed.startsWith('--')) {
+    statements.push(trimmed);
+  }
   
   for (const statement of statements) {
     try {
@@ -34,7 +78,7 @@ export function validateSQL(sql: string, dialect: 'pg' | 'sqlite'): { valid: boo
       parser.astify(statement, { database: parserDialect });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      errors.push(`SQL validation error in statement: ${errorMessage}\nStatement: ${statement.substring(0, 100)}${statement.length > 100 ? '...' : ''}`);
+      errors.push(`SQL validation error in statement: ${errorMessage}\nStatement: ${statement.substring(0, 200)}${statement.length > 200 ? '...' : ''}`);
     }
   }
   

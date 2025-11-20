@@ -86,8 +86,8 @@ export function createComposedBuilders(
     const uuidDefault = (name: string, { length = defaultLength }: { length?: number } = {}): ColumnBuilderWithReferences => {
         // Use unbound column to avoid $defaultFn issues with bound builders
         const unbound = unboundVarchar(name, { length });
-        // @ts-ignore - default() accepts functions, TypeScript may not infer correctly
-        const withDefault = unbound.default(() => generateUUID(length));
+        // Use $defaultFn() - Drizzle's recommended way for function defaults
+        const withDefault = unbound.$defaultFn(() => generateUUID(length));
         // Cast to bound builder type - will be properly bound when used in table
         return withDefault as any as ColumnBuilderWithReferences;
     }
@@ -95,8 +95,8 @@ export function createComposedBuilders(
     const uuidPK = (name: string, { length = defaultLength }: { length?: number } = {}): ColumnBuilderWithReferences => {
         // Use unbound column to avoid $defaultFn issues with bound builders
         const unbound = unboundVarchar(name, { length });
-        // @ts-ignore - default() accepts functions, TypeScript may not infer correctly
-        const withDefault = unbound.default(() => generateUUID(length));
+        // Use $defaultFn() - Drizzle's recommended way for function defaults
+        const withDefault = unbound.$defaultFn(() => generateUUID(length));
         // @ts-ignore - primaryKey() returns UColumn, we cast to bound builder type
         const withPK = withDefault.primaryKey();
         // Cast to bound builder type - will be properly bound when used in table

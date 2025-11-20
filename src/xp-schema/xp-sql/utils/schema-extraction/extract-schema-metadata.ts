@@ -165,12 +165,16 @@ export function getSchemaJsonFromBoundTables(
   dialect: 'sqlite' | 'pg'
 ): Record<string, TableMetadata> {
   const metadata: Record<string, TableMetadata> = {};
-  for (const [tableName, table] of Object.entries(tables)) {
+  for (const [schemaKey, table] of Object.entries(tables)) {
     try {
-      metadata[tableName] = extractTableMetadata(table, dialect);
+      const tableMeta = extractTableMetadata(table, dialect);
+      // Use the actual table name from the metadata, not the schema key
+      // This ensures the metadata key matches the actual database table name
+      const actualTableName = tableMeta.name || schemaKey;
+      metadata[actualTableName] = tableMeta;
     } catch (error: any) {
       throw new Error(
-        `Failed to extract metadata for table "${tableName}": ${error.message}. ` +
+        `Failed to extract metadata for table "${schemaKey}": ${error.message}. ` +
         `Table type: ${typeof table}, table keys: ${Object.keys(table || {}).slice(0, 10).join(', ')}. ` +
         `Original error: ${error.stack || error}`
       );

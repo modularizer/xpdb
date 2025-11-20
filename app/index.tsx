@@ -8,6 +8,8 @@ import React from 'react';
 import { useRouter } from 'expo-router';
 import TestPage, { type Test } from '../src/pages/TestPage';
 import { runCRUDTest } from '../src/tests/crud-test';
+import { runSportsDBTest } from '../src/tests/sports-db-test';
+import { runDebugInsertTest } from '../src/tests/debug-insert-test';
 
 // Define available tests
 const tests: Test[] = [
@@ -20,6 +22,26 @@ const tests: Test[] = [
       dialectName: 'pg',
     },
     run: (addLog) => runCRUDTest(addLog, 'crud-test'),
+  },
+  {
+    name: 'Sports DB',
+    description: 'Sets up and seeds a sports database with leagues, teams, players, games, and stats',
+    connectionInfo: {
+      name: 'sports-db',
+      driverName: 'pglite',
+      dialectName: 'pg',
+    },
+    run: (addLog) => runSportsDBTest(addLog, 'sports-db'),
+  },
+  {
+    name: 'Debug Insert Test',
+    description: 'Simplified tests to isolate insert failures with uuidPK',
+    connectionInfo: {
+      name: 'debug-test',
+      driverName: 'pglite',
+      dialectName: 'pg',
+    },
+    run: (addLog) => runDebugInsertTest(addLog, 'debug-test'),
   },
 ];
 

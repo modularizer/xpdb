@@ -212,6 +212,20 @@ export class UColumn<
   }
 
   /**
+   * Add .$defaultFn() modifier (for function defaults)
+   * This is Drizzle's recommended way to handle function defaults
+   * Sets hasDefault to true
+   * Preserves the primary key state and unique state
+   */
+  $defaultFn(fn: () => TType | any): UColumn<TType, TFlags & { hasDefault: true }> {
+    this.data = {
+      ...this.data,
+      modifiers: [...this.data.modifiers, { method: '$defaultFn', args: [fn] }],
+    };
+    return this as any;
+  }
+
+  /**
    * Add .$type() modifier (for TypeScript type inference)
    * Usage: text('data').$type<MyType>()
    * Returns a builder with the overridden type, preserving nullable, default, primary key, and unique state
@@ -551,12 +565,39 @@ export function bindColumn(
       builder = builder.primaryKey();
     } else if (modifier.method === 'notNull') {
       builder = builder.notNull();
+    } else if (modifier.method === '$defaultFn') {
+        // Handle $defaultFn modifier - Drizzle's recommended way for function defaults
+        // $defaultFn stores the function in col.defaultFn, which Drizzle calls during insert
+        const defaultFn = modifier.args[0];
+        if (typeof defaultFn !== 'function') {
+            throw new Error(`Column "${unboundColumn.name}" has $defaultFn modifier but the argument is not a function`);
+        }
+        if (typeof (builder as any).$defaultFn === 'function') {
+            builder = (builder as any).$defaultFn(defaultFn);
+        } else {
+            throw new Error(
+                `Column "${unboundColumn.name}" has $defaultFn modifier but $defaultFn is not available on the column builder. ` +
+                `This means function defaults will not work correctly. ` +
+                `Please ensure you're using a Drizzle version that supports $defaultFn, or use database-level defaults instead.`
+            );
+        }
     } else if (modifier.method === 'default' && typeof builder.default === 'function') {
-        // Check if the default value is a function - if so, use $defaultFn if available
+        // Handle .default() modifier - check if it's a function or literal value
         const defaultArg = modifier.args[0];
-        if (typeof defaultArg === 'function' && typeof (builder as any).$defaultFn === 'function') {
-            // Use $defaultFn for function defaults (Drizzle's recommended way)
-            builder = (builder as any).$defaultFn(defaultArg);
+        if (typeof defaultArg === 'function') {
+            // Function passed to .default() - should use $defaultFn instead
+            // But for backwards compatibility, try to use $defaultFn if available
+            if (typeof (builder as any).$defaultFn === 'function') {
+                builder = (builder as any).$defaultFn(defaultArg);
+            } else {
+                // Fallback to .default() - may not work correctly with Drizzle
+                console.warn(
+                    `Column "${unboundColumn.name}" has a function default but $defaultFn is not available. ` +
+                    `Using .default() as fallback, but this may not work correctly. ` +
+                    `Consider using .$defaultFn() instead.`
+                );
+                builder = builder.default(defaultArg);
+            }
         } else {
             // Use .default() for literal values
             builder = builder.default(...modifier.args);
