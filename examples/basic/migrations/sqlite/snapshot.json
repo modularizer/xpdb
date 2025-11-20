@@ -1,0 +1,138 @@
+{
+  "version": 1,
+  "timestamp": 1763584772687,
+  "migrationName": "0003_migration",
+  "tables": {
+    "posts": {
+      "name": "posts",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "TEXT",
+          "length": 16,
+          "nullable": false,
+          "hasDefault": false
+        },
+        "author": {
+          "name": "author",
+          "type": "TEXT",
+          "nullable": false,
+          "hasDefault": false
+        },
+        "posted_at": {
+          "name": "posted_at",
+          "type": "INTEGER",
+          "nullable": true,
+          "hasDefault": true,
+          "defaultValue": {
+            "type": "sql",
+            "queryChunks": [
+              {
+                "value": [
+                  "(strftime('%s','now'))"
+                ]
+              }
+            ]
+          }
+        },
+        "content": {
+          "name": "content",
+          "type": "TEXT",
+          "length": 2000,
+          "nullable": true,
+          "hasDefault": false
+        }
+      },
+      "primaryKeys": [
+        "id"
+      ],
+      "foreignKeys": [
+        {
+          "localColumns": [
+            "author"
+          ],
+          "refTable": "users",
+          "refColumns": [
+            "name"
+          ]
+        }
+      ],
+      "uniqueConstraints": [],
+      "indexes": []
+    },
+    "users": {
+      "name": "users",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "TEXT",
+          "length": 16,
+          "nullable": false,
+          "hasDefault": false
+        },
+        "name": {
+          "name": "name",
+          "type": "TEXT",
+          "nullable": true,
+          "hasDefault": false
+        },
+        "birthday": {
+          "name": "birthday",
+          "type": "INTEGER",
+          "nullable": false,
+          "hasDefault": false
+        },
+        "gender": {
+          "name": "gender",
+          "type": "TEXT",
+          "enumValues": [
+            "male",
+            "female"
+          ],
+          "nullable": true,
+          "hasDefault": false
+        },
+        "bio": {
+          "name": "bio",
+          "type": "TEXT",
+          "nullable": true,
+          "hasDefault": false
+        },
+        "headline": {
+          "name": "headline",
+          "type": "TEXT",
+          "length": 40,
+          "nullable": true,
+          "hasDefault": false
+        },
+        "metadata": {
+          "name": "metadata",
+          "type": "TEXT",
+          "nullable": true,
+          "hasDefault": false
+        }
+      },
+      "primaryKeys": [
+        "id"
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [
+        {
+          "columns": [
+            "name"
+          ]
+        }
+      ],
+      "indexes": [
+        {
+          "name": "user_name",
+          "columns": [
+            "name"
+          ],
+          "unique": false
+        }
+      ]
+    }
+  },
+  "schemaHash": "25782487680cab8859fa37248e859e2a3d2f3ce18210aed0c9fc344d1c0bb3fd"
+}

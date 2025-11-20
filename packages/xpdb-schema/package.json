@@ -1,0 +1,84 @@
+{
+  "name": "xpdb-schema",
+  "version": "0.1.0",
+  "description": "Cross-platform database schema builder - define your schema once and use it across multiple SQL dialects and implementations",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "xpdb-gen": "./bin/xpdb-gen.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "npm run build:cjs && npm run build:esm && npm run build:rename-cjs",
+    "build:cjs": "tsc",
+    "build:esm": "tsc -p tsconfig.cjs.json",
+    "build:rename-cjs": "node scripts/rename-cjs.js",
+    "dev": "npm run build:cjs",
+    "dev:watch": "npm run build:cjs -- --watch",
+    "prepublishOnly": "npm run build",
+    "clean": "rm -rf dist dist-esm"
+  },
+  "keywords": [
+    "database",
+    "schema",
+    "orm",
+    "drizzle",
+    "cross-platform",
+    "postgresql",
+    "sqlite",
+    "typescript",
+    "migrations"
+  ],
+  "author": "",
+  "license": "Unlicense",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "dependencies": {
+    "@ts-morph/common": "^0.25.0",
+    "drizzle-orm": "^0.29.0",
+    "ts-morph": "^21.0.1"
+  },
+  "peerDependencies": {
+    "drizzle-orm": "^0.29.0",
+    "expo-file-system": "^16.0.0",
+    "expo-sqlite": "^13.0.0",
+    "pglite": "^0.1.0",
+    "postgres": "^3.4.0"
+  },
+  "peerDependenciesMeta": {
+    "postgres": {
+      "optional": true
+    },
+    "pglite": {
+      "optional": true
+    },
+    "expo-sqlite": {
+      "optional": true
+    },
+    "expo-file-system": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

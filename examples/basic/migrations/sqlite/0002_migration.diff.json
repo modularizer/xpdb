@@ -1,0 +1,31 @@
+{
+  "migrationName": "0002_migration",
+  "schemaHash": "df96d66dbc53761dda5f255527069fd63962e7203320c284eb7e92b7dda6f2a9",
+  "previousSchemaHash": "4de491f10dccf6f3d10bc5bb92c43bed575eb3adb53ede54f75a6159538df996",
+  "timestamp": 1763584749631,
+  "diff": {
+    "addedTables": [],
+    "removedTables": [],
+    "modifiedTables": [
+      {
+        "tableName": "users",
+        "addedColumns": [],
+        "removedColumns": [],
+        "modifiedColumns": [
+          {
+            "columnName": "headline",
+            "changes": [
+              "length: 30 -> 40"
+            ]
+          }
+        ],
+        "addedForeignKeys": [],
+        "removedForeignKeys": [],
+        "addedUniqueConstraints": [],
+        "removedUniqueConstraints": [],
+        "addedIndexes": [],
+        "removedIndexes": []
+      }
+    ]
+  }
+}
