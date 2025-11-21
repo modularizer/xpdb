@@ -29,7 +29,7 @@ export default function RootLayout() {
         }} 
       />
         <Stack.Screen
-            name="db-browser/[db]"
+            name="db-browser/[db]/index"
             options={{
                 headerShown: false,
                 title: ''

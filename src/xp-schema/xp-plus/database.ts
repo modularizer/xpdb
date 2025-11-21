@@ -425,14 +425,33 @@ export class XPDatabaseConnectionPlus<TTables extends Record<string, Table> = Re
             // Use Drizzle's sql template tag for dynamic table names
             const result = await this.db.execute(
                 sql`SELECT COUNT(*) as count FROM ${sql.identifier(tableName)}`
-            ) as any[];
+            );
             
-            const rowCount = result[0]?.count;
+            // QueryResult has a rows property, not a direct array
+            const rows = (result as any).rows;
+            if (!rows || !Array.isArray(rows) || rows.length === 0) {
+                console.warn(`[getRowCount] No rows returned for table ${tableName}, result:`, result);
+                return 0;
+            }
+            
+            const firstRow = rows[0];
+            if (!firstRow) {
+                console.warn(`[getRowCount] First row is null/undefined for table ${tableName}`);
+                return 0;
+            }
+            
+            // Try different possible property names for the count
+            const rowCount = firstRow.count ?? firstRow['COUNT(*)'] ?? firstRow['count(*)'];
+            
             if (typeof rowCount === 'number') {
                 return rowCount;
+            } else if (typeof rowCount === 'bigint') {
+                return Number(rowCount);
             } else if (rowCount !== null && rowCount !== undefined) {
-                return parseInt(String(rowCount), 10) || 0;
+                const parsed = parseInt(String(rowCount), 10);
+                return isNaN(parsed) ? 0 : parsed;
             }
+            console.warn(`[getRowCount] Could not extract count from result for table ${tableName}, firstRow:`, firstRow);
             return 0;
         } catch (err) {
             // Table might not exist or be accessible
