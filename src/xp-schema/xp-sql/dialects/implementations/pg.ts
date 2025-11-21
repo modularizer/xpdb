@@ -294,7 +294,8 @@ async function getTableColumns(db: DrizzleDatabaseConnectionDriver, tableName: s
         SELECT 
           column_name as name,
           data_type as "dataType",
-          is_nullable = 'YES' as "isNullable"
+          is_nullable = 'YES' as "isNullable",
+          column_default as "columnDefault"
         FROM information_schema.columns
         WHERE table_schema = ${schemaName} AND table_name = ${tableName}
         ORDER BY ordinal_position
@@ -304,6 +305,7 @@ async function getTableColumns(db: DrizzleDatabaseConnectionDriver, tableName: s
         name: row.name,
         dataType: row.dataType || row.data_type || 'unknown',
         isNullable: row.isNullable !== undefined ? row.isNullable : row.is_nullable === 'YES',
+        columnDefault: row.columnDefault || row.column_default || null,
     }));
     return info.map((row: ColumnInfo) => ({
         ...row,
@@ -439,6 +441,27 @@ async function getTableForeignKeys(
     }));
 }
 
+/**
+ * Validate constraint/index name - must only contain alphanumeric characters, underscores, and dollar signs
+ * Throws error if name contains invalid characters (spaces, special chars, etc.)
+ */
+function validateConstraintName(name: string | undefined, context: string): void {
+    if (!name) return; // Empty names are allowed (auto-generated)
+    
+    // Check for invalid characters (spaces, special chars except _ and $)
+    if (!/^[A-Za-z0-9_$]+$/.test(name)) {
+        const invalidChars = name.split('').filter(c => !/^[A-Za-z0-9_$]$/.test(c));
+        const uniqueInvalidChars = [...new Set(invalidChars)];
+        throw new Error(
+            `Invalid constraint/index name "${name}" in ${context}: ` +
+            `contains invalid characters: ${uniqueInvalidChars.map(c => `"${c}"`).join(', ')}. ` +
+            `Constraint and index names must only contain alphanumeric characters, underscores, and dollar signs. ` +
+            `This constraint/index was created in the database with an invalid name. ` +
+            `The constraint/index must be renamed in the database to use only valid characters.`
+        );
+    }
+}
+
 async function getTableUniqueConstraints(
     db: DrizzleDatabaseConnectionDriver,
     tableName: string,
@@ -470,13 +493,18 @@ async function getTableUniqueConstraints(
         const constraintName = row.constraintName || row.constraint_name;
         const columnName = row.columnName || row.column_name;
 
-        if (!uniqueMap.has(constraintName)) {
+        // Validate constraint name - throw error if invalid
+        validateConstraintName(constraintName, `table "${tableName}" unique constraint`);
+
+        if (constraintName && !uniqueMap.has(constraintName)) {
             uniqueMap.set(constraintName, {
                 name: constraintName,
                 columns: [],
             });
         }
-        uniqueMap.get(constraintName)!.columns.push(columnName);
+        if (constraintName) {
+            uniqueMap.get(constraintName)!.columns.push(columnName);
+        }
     }
 
     return Array.from(uniqueMap.values()).map(uc => ({
@@ -527,16 +555,21 @@ async function getTableIndexes(
         const columnName = row.columnName || row.attname;
         const isUnique = row.isUnique || row.indisunique;
 
-        if (!indexMap.has(indexName)) {
+        // Validate index name - throw error if invalid
+        validateConstraintName(indexName, `table "${tableName}" index`);
+
+        if (indexName && !indexMap.has(indexName)) {
             indexMap.set(indexName, {
                 name: indexName,
                 columns: [],
                 unique: !!isUnique,
             });
         }
-        const idx = indexMap.get(indexName)!;
-        if (!idx.columns.includes(columnName)) {
-            idx.columns.push(columnName);
+        if (indexName) {
+            const idx = indexMap.get(indexName)!;
+            if (!idx.columns.includes(columnName)) {
+                idx.columns.push(columnName);
+            }
         }
     }
 
@@ -545,6 +578,81 @@ async function getTableIndexes(
         columns: idx.columns,
         unique: idx.unique,
     }));
+}
+
+/**
+ * Get CHECK constraints for a table
+ * Returns constraints that match enum patterns: CHECK (column_name IN ('val1', 'val2', ...))
+ */
+async function getTableCheckConstraints(
+    db: DrizzleDatabaseConnectionDriver,
+    tableName: string,
+    schemaName: string = 'public'
+): Promise<Array<{ name: string; columnName: string; checkExpression: string }>> {
+    const result = await db.execute(sql`
+        SELECT
+            tc.constraint_name as "constraintName",
+            cc.check_clause as "checkClause"
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.check_constraints cc
+            ON tc.constraint_name = cc.constraint_name
+            AND tc.table_schema = cc.constraint_schema
+        WHERE tc.constraint_type = 'CHECK'
+            AND tc.table_schema = ${schemaName}
+            AND tc.table_name = ${tableName}
+    `);
+
+    if (!result || !result.rows || result.rows.length === 0) {
+        return [];
+    }
+
+    const checkConstraints: Array<{ name: string; columnName: string; checkExpression: string }> = [];
+    
+    for (const row of result.rows as any[]) {
+        const constraintName = row.constraintName || row.constraint_name;
+        const checkClause = row.checkClause || row.check_clause;
+        
+        if (!constraintName || !checkClause) {
+            continue;
+        }
+        
+        // Parse CHECK constraint to extract column name
+        // Note: check_clause in information_schema contains just the expression, not "CHECK (...)"
+        // PostgreSQL can store enum constraints in two formats:
+        // 1. Simple IN: "column_name" IN ('val1', 'val2', ...) or column_name IN ('val1', 'val2', ...)
+        // 2. ANY with ARRAY: (("column_name")::text = ANY ((ARRAY['val1'::character varying, 'val2'::character varying, ...])::text[]))
+        
+        let columnName: string | null = null;
+        const trimmedClause = checkClause.trim();
+        
+        // Try pattern 1: IN format
+        const inPattern = /^\(*\s*"?(\w+)"?\s*\)*\s+IN\s*\(([^)]+)\)\s*$/i;
+        let match = trimmedClause.match(inPattern);
+        
+        if (match) {
+            columnName = match[1];
+        } else {
+            // Try pattern 2: ANY with ARRAY format
+            // Pattern: (("column_name")::text = ANY ((ARRAY['val1'::character varying, 'val2'::character varying, ...])::text[]))
+            const anyPattern = /\(*\s*\(*"?(\w+)"?\)*\s*::\s*text\s*=\s*ANY\s*\(\(ARRAY\[([^\]]+)\]\)/i;
+            match = trimmedClause.match(anyPattern);
+            
+            if (match) {
+                columnName = match[1];
+            }
+        }
+        
+        if (columnName) {
+            // Store the full check expression - enum values will be extracted later
+            checkConstraints.push({
+                name: constraintName,
+                columnName: columnName,
+                checkExpression: checkClause,
+            });
+        }
+    }
+    
+    return checkConstraints;
 }
 
 async function getRuntimeTable(
@@ -578,6 +686,7 @@ const pgDialect: SQLDialect = {
     getTableForeignKeys,
     getTableUniqueConstraints,
     getTableIndexes,
+    getTableCheckConstraints,
     getTableConfig: drizzleGetTableConfig,
 
 

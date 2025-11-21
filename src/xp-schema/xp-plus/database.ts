@@ -24,7 +24,7 @@ import {getSchemaJsonFromBoundTables} from "../xp-sql/utils/schema-extraction/ex
 import {extractRuntimeSchemaMetadata} from "../xp-sql/utils/schema-extraction/extract-runtime-metadata";
 import {compareTables, type SchemaDiff} from "../xp-sql/utils/schema-extraction/schema-diff";
 import {generateMigrationFromSnapshotDiff, type SchemaSnapshot} from "../xp-sql/utils/sql-generation/snapshot-sql-generator";
-import {bindTable, isUTable} from "../xp-sql/dialects/implementations/unbound";
+import {bindTable, isUTable, type UTable} from "../xp-sql/dialects/implementations/unbound";
 
 
 
@@ -127,10 +127,23 @@ export class XPDatabaseConnectionPlus<TTables extends Record<string, Table> = Re
         
         // Bind all unbound tables to the dialect before storing
         // This ensures this.schema always contains bound Drizzle tables
+        // First pass: bind all tables (FKs will be deferred)
         const boundSchema: Record<string, Table> = {};
+        const unboundSchema: Record<string, UTable<any> | Table> = schema;
+        
+        // Create a registry to map unbound tables to bound tables for FK resolution
+        const tableRegistry = new Map<UTable<any>, Table>();
         
         for (const [tableName, table] of Object.entries(schema)) {
-            const boundTable = bindTable(table, this.dialect);
+            // Store unbound table in registry before binding
+            if (isUTable(table)) {
+                // We'll populate the registry after binding
+            }
+            const boundTable = bindTable(table, this.dialect, tableRegistry);
+            if (isUTable(table)) {
+                tableRegistry.set(table, boundTable);
+            }
+            boundSchema[tableName] = boundTable;
             
             const config = this.dialect.getTableConfig(boundTable);
             if (!config || !config.columns || typeof config.columns !== 'object') {
@@ -161,7 +174,7 @@ export class XPDatabaseConnectionPlus<TTables extends Record<string, Table> = Re
             console.log('[XPDatabaseConnectionPlus] Runtime schema detected:', runtimeTableNames);
             console.log('[XPDatabaseConnectionPlus] Target schema (passed in):', schemaTableNames);
             
-            const targetMetadata = getSchemaJsonFromBoundTables(boundSchema, this.dialect.dialectName as 'sqlite' | 'pg');
+            const targetMetadata = await getSchemaJsonFromBoundTables(boundSchema, this.dialect.dialectName as 'sqlite' | 'pg');
             const liveMetadata = await extractRuntimeSchemaMetadata(this.db, this.dialect, 'public');
             
             const liveTableNames = new Set(Object.keys(liveMetadata));
@@ -280,7 +293,8 @@ export class XPDatabaseConnectionPlus<TTables extends Record<string, Table> = Re
      */
     async getSchemaJson(): Promise<Record<string, any>> {
         await this.schemaPromise;
-        return getSchemaJsonFromBoundTables(this.schema, this.dialect.dialectName as 'sqlite' | 'pg');
+        const metadata = await getSchemaJsonFromBoundTables(this.schema, this.dialect.dialectName as 'sqlite' | 'pg');
+        return metadata;
     }
     getTable<TTable extends Table>(table: TTable): XPDatabaseTablePlusWithColumns<TTable> {
         return new XPDatabaseTablePlus(this, table) as XPDatabaseTablePlusWithColumns<TTable>;
@@ -485,7 +499,7 @@ export class XPDatabaseConnectionPlus<TTables extends Record<string, Table> = Re
             return tableNames.length === 0;
         }
 
-        const targetMetadata = getSchemaJsonFromBoundTables(this.schema, this.dialect.dialectName as 'sqlite' | 'pg');
+        const targetMetadata = await getSchemaJsonFromBoundTables(this.schema, this.dialect.dialectName as 'sqlite' | 'pg');
         const liveMetadata = await extractRuntimeSchemaMetadata(this.db, this.dialect, schemaName);
         
         const liveTableNames = new Set(Object.keys(liveMetadata));
@@ -556,7 +570,7 @@ export class XPDatabaseConnectionPlus<TTables extends Record<string, Table> = Re
             throw new Error('Schema has no tables to extract metadata from');
         }
         
-        const targetMetadata = getSchemaJsonFromBoundTables(this.schema, this.dialect.dialectName as 'sqlite' | 'pg');
+        const targetMetadata = await getSchemaJsonFromBoundTables(this.schema, this.dialect.dialectName as 'sqlite' | 'pg');
         const liveMetadata = await extractRuntimeSchemaMetadata(this.db, this.dialect, schemaName);
 
         const liveTableNames = new Set(Object.keys(liveMetadata));
@@ -577,6 +591,47 @@ export class XPDatabaseConnectionPlus<TTables extends Record<string, Table> = Re
             }
         }
 
+        // Log the diff for debugging
+        console.log('[XPDatabaseConnectionPlus] Schema diff:', JSON.stringify(diff, null, 2));
+        
+        // Log detailed information about modified tables
+        if (diff.modifiedTables.length > 0) {
+            console.log('[XPDatabaseConnectionPlus] Modified tables details:');
+            for (const tableDiff of diff.modifiedTables) {
+                console.log(`  Table: ${tableDiff.tableName}`);
+                if (tableDiff.addedColumns.length > 0) {
+                    console.log(`    Added columns: ${tableDiff.addedColumns.join(', ')}`);
+                }
+                if (tableDiff.removedColumns.length > 0) {
+                    console.log(`    Removed columns: ${tableDiff.removedColumns.join(', ')}`);
+                }
+                if (tableDiff.modifiedColumns.length > 0) {
+                    console.log(`    Modified columns:`);
+                    for (const modCol of tableDiff.modifiedColumns) {
+                        console.log(`      ${modCol.columnName}: ${modCol.changes.join(', ')}`);
+                    }
+                }
+                if (tableDiff.addedForeignKeys.length > 0) {
+                    console.log(`    Added foreign keys: ${tableDiff.addedForeignKeys.length}`);
+                }
+                if (tableDiff.removedForeignKeys.length > 0) {
+                    console.log(`    Removed foreign keys: ${tableDiff.removedForeignKeys.length}`);
+                }
+                if (tableDiff.addedUniqueConstraints.length > 0) {
+                    console.log(`    Added unique constraints: ${tableDiff.addedUniqueConstraints.length}`);
+                }
+                if (tableDiff.removedUniqueConstraints.length > 0) {
+                    console.log(`    Removed unique constraints: ${tableDiff.removedUniqueConstraints.length}`);
+                }
+                if (tableDiff.addedIndexes.length > 0) {
+                    console.log(`    Added indexes: ${tableDiff.addedIndexes.length}`);
+                }
+                if (tableDiff.removedIndexes.length > 0) {
+                    console.log(`    Removed indexes: ${tableDiff.removedIndexes.length}`);
+                }
+            }
+        }
+
         // Check if there are any differences
         const hasChanges = 
             diff.addedTables.length > 0 ||
@@ -585,12 +640,15 @@ export class XPDatabaseConnectionPlus<TTables extends Record<string, Table> = Re
 
         if (!hasChanges) {
             // No changes needed - database is already up to date
+            console.log('[XPDatabaseConnectionPlus] No schema changes detected');
             return {
                 migrationSQL: '',
                 diff,
                 executed: false,
             };
         }
+
+        console.log(`[XPDatabaseConnectionPlus] Schema changes detected: ${diff.addedTables.length} added tables, ${diff.removedTables.length} removed tables, ${diff.modifiedTables.length} modified tables`);
 
         // Create snapshots for migration generation
         const targetSnapshot: SchemaSnapshot = {
@@ -610,6 +668,7 @@ export class XPDatabaseConnectionPlus<TTables extends Record<string, Table> = Re
         };
 
         // Generate migration SQL
+        console.log('[XPDatabaseConnectionPlus] Generating migration SQL from diff...');
         const migrationSQL = generateMigrationFromSnapshotDiff(
             diff,
             targetSnapshot,

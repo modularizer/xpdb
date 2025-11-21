@@ -160,14 +160,14 @@ export function getTableJson(
  * @param dialect - The SQL dialect
  * @returns JSON-serializable schema metadata
  */
-export function getSchemaJsonFromBoundTables(
+export async function getSchemaJsonFromBoundTables(
   tables: Record<string, Table>,
   dialect: 'sqlite' | 'pg'
-): Record<string, TableMetadata> {
+): Promise<Record<string, TableMetadata>> {
   const metadata: Record<string, TableMetadata> = {};
   for (const [schemaKey, table] of Object.entries(tables)) {
     try {
-      const tableMeta = extractTableMetadata(table, dialect);
+      const tableMeta = await Promise.resolve(extractTableMetadata(table, dialect));
       // Use the actual table name from the metadata, not the schema key
       // This ensures the metadata key matches the actual database table name
       const actualTableName = tableMeta.name || schemaKey;

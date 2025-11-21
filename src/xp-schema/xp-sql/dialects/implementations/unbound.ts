@@ -139,6 +139,9 @@ export class UColumn<
 > {
   private data: ColData;
   private _ref?: UColumn<any, any> | ColData | ColumnBuilder | (() => UColumn<any, any> | ColData | ColumnBuilder);
+  private _refTableName?: string; // Store referenced table name for FK resolution
+  private _refColumnName?: string; // Store referenced column name for FK resolution
+  private _parentTable?: UTable<any>; // Store parent table reference
 
   constructor(type: string, name: string, options?: any) {
     this.data = {
@@ -294,15 +297,113 @@ export class UColumn<
     ): UColumn<TType, TFlags & { ref: TRefColumn }> {
         // Store the reference (function, UColumn, ColData, or ColumnBuilder)
         this._ref = typeof ref === 'function' ? ref : ref;
+        
+        // Extract table and column names from the referenced column
+        // The referenced column (e.g., otherTable.name) should have _parentTable set
+        // We extract the table name from _parentTable.__name and column name from getData().name
+        // This info is stored and used later when resolving the FK after tables are bound
+        let refTableName: string | undefined;
+        let refColumnName: string | undefined;
+        
+        if (typeof ref === 'function') {
+            // Call the function to get the referenced column (e.g., () => otherTable.name)
+            const refCol = ref();
+            if (refCol instanceof UColumn) {
+                // Get the column name from the referenced column
+                refColumnName = refCol.getData().name;
+                
+                // Get the table name from the column's parent table
+                // The referenced column MUST have _parentTable set - this is set when the table is created
+                const parentTable = (refCol as any)._parentTable;
+                if (!parentTable) {
+                    throw new Error(
+                        `Column "${refColumnName}" referenced in FK does not have _parentTable set. ` +
+                        `This indicates the referenced table was not properly created with unboundTable(). ` +
+                        `The column should have _parentTable set when its table is created. ` +
+                        `This is a bug - all columns must have _parentTable set when their table is created.`
+                    );
+                }
+                if (!parentTable.__name) {
+                    throw new Error(
+                        `Column "${refColumnName}" referenced in FK has _parentTable set but _parentTable.__name is missing. ` +
+                        `_parentTable type: ${typeof parentTable}, ` +
+                        `_parentTable keys: ${Object.keys(parentTable || {}).join(', ')}. ` +
+                        `This is a bug - _parentTable must be a UTable with __name property.`
+                    );
+                }
+                refTableName = parentTable.__name;
+            } else if (refCol && typeof refCol === 'object' && 'name' in refCol) {
+                refColumnName = (refCol as any).name;
+            }
+        } else if (ref instanceof UColumn) {
+            // Direct UColumn reference (not a function)
+            refColumnName = ref.getData().name;
+            const parentTable = (ref as any)._parentTable;
+            if (!parentTable) {
+                throw new Error(
+                    `Column "${refColumnName}" referenced in FK does not have _parentTable set. ` +
+                    `This indicates the referenced table was not properly created with unboundTable(). ` +
+                    `This is a bug - all columns must have _parentTable set when their table is created.`
+                );
+            }
+            if (!parentTable.__name) {
+                throw new Error(
+                    `Column "${refColumnName}" referenced in FK has _parentTable set but _parentTable.__name is missing. ` +
+                    `This is a bug - _parentTable must be a UTable with __name property.`
+                );
+            }
+            refTableName = parentTable.__name;
+        } else if (ref && typeof ref === 'object' && 'name' in ref) {
+            refColumnName = (ref as any).name;
+        }
+        
+        // Store the reference info - this will be used later when resolving the FK
+        // CRITICAL: Both _refTableName and _refColumnName MUST be set for FK resolution to work
+        this._refTableName = refTableName;
+        this._refColumnName = refColumnName;
+        
+        // Validate that we successfully extracted both table and column names
+        if (typeof ref === 'function') {
+            const refCol = ref();
+            if (refCol instanceof UColumn) {
+                if (!refTableName || !refColumnName) {
+                    throw new Error(
+                        `Failed to extract reference info from column. ` +
+                        `refTableName: ${refTableName || 'not set'}, refColumnName: ${refColumnName || 'not set'}. ` +
+                        `This is a bug - both table and column names must be extractable from the referenced column.`
+                    );
+                }
+            }
+        } else if (ref instanceof UColumn) {
+            if (!refTableName || !refColumnName) {
+                throw new Error(
+                    `Failed to extract reference info from UColumn. ` +
+                    `refTableName: ${refTableName || 'not set'}, refColumnName: ${refColumnName || 'not set'}. ` +
+                    `This is a bug - both table and column names must be extractable from the referenced column.`
+                );
+            }
+        }
+        
         // Store the reference and options in the modifier args
+        // CRITICAL: Also store _refTableName and _refColumnName in the modifier args
+        // so that refFn() can access them when binding, since refFn() doesn't have access
+        // to the UColumn instance that called .references()
         const refArg = typeof ref === 'function' ? ref : () => ref;
         const args: any[] = [refArg];
         if (options) {
             args.push(options);
         }
+        // Store the reference info in the modifier args so bindColumn can access it
+        // This is needed because refFn() doesn't have access to the UColumn instance
+        const modifierData: any = {
+            method: 'references',
+            args,
+            _refTableName: refTableName,  // Store for refFn() to access
+            _refColumnName: refColumnName, // Store for refFn() to access
+        };
         this.data = {
             ...this.data,
-            modifiers: [...this.data.modifiers, { method: 'references', args }],
+            modifiers: [...this.data.modifiers, modifierData],
         };
         return this as any;
     }
@@ -472,13 +573,35 @@ export type SimplifyUColumn<T> = T extends UColumn<infer TType, infer TFlags>
  * Check if a column is already bound (is a ColumnBuilder, not UnboundColumnData)
  */
 function isBoundColumn(column: any): column is ColumnBuilder {
-  // If it has __unbound, it's unbound
-  if (column && typeof column === 'object' && column.__unbound === true) {
+  if (!column || typeof column !== 'object') {
     return false;
   }
-  // If it's a ColumnBuilder, it should have certain properties
+  
+  // If it has __unbound, it's unbound
+  if (column.__unbound === true) {
+    return false;
+  }
+  
+  // If it's a UColumn instance, it's unbound
+  if (column instanceof UColumn) {
+    return false;
+  }
+  
   // Drizzle ColumnBuilders have _ property and config
-  return column && typeof column === 'object' && ('_' in column || 'config' in column);
+  // Also check for other Drizzle-specific properties
+  if ('_' in column || 'config' in column || 'table' in column) {
+    return true;
+  }
+  
+  // Check if it has Drizzle column builder methods (like .notNull(), .primaryKey(), etc.)
+  // but doesn't have UColumn methods (like .getData())
+  if (typeof column.notNull === 'function' && 
+      typeof column.primaryKey === 'function' && 
+      typeof column.getData !== 'function') {
+    return true;
+  }
+  
+  return false;
 }
 
 /**
@@ -518,7 +641,8 @@ function getDialectFromBoundColumn(column: ColumnBuilder): string | null {
  */
 export function bindColumn(
   column: ColData | ColumnBuilder,
-  dialect: SQLDialect
+  dialect: SQLDialect,
+  tableRegistry?: Map<UTable<any>, Table>
 ): ColumnBuilder {
   // Check if already bound
   if (isBoundColumn(column)) {
@@ -611,12 +735,184 @@ export function bindColumn(
         console.warn(`defaultNow() not available on column builder, skipping`);
       }
     } else if (modifier.method === 'references' && typeof builder.references === 'function') {
+        // The refFn is called by Drizzle when processing the FK during table creation
+        // At that point, the referenced table might not be bound yet
+        // We need to look it up in the schema registry and bind it on-the-fly
+        // CRITICAL: Get _refTableName and _refColumnName from the modifier data
+        // These were stored when .references() was called on the UColumn
+        const refTableName = (modifier as any)._refTableName;
+        const refColumnName = (modifier as any)._refColumnName;
+        
+        if (!refTableName || !refColumnName) {
+            throw new Error(
+                `FK modifier is missing reference info. ` +
+                `refTableName: ${refTableName || 'not set'}, refColumnName: ${refColumnName || 'not set'}. ` +
+                `This indicates _refTableName and _refColumnName were not stored in the modifier when .references() was called. ` +
+                `This is a bug - UColumn.references() must store _refTableName and _refColumnName in the modifier data.`
+            );
+        }
+        
         const refFn = () => {
+            // Get the column from the reference function
+            // This might return an unbound column if the referenced table isn't bound yet
             const col = modifier.args[0]();
-            return bindColumn(col, dialect);
+            
+            if (!col) {
+                throw new Error(
+                    `FK reference function returned null or undefined. ` +
+                    `This indicates the referenced column/table is not properly defined.`
+                );
+            }
+            
+            // If the column is already bound and has a .table property, return it as-is
+            if (isBoundColumn(col) && (col as any).table) {
+                // Verify it's actually a column, not an FK object
+                if ((col as any).foreignTable || (col as any).foreignColumns) {
+                    throw new Error(
+                        `FK reference function returned a foreign key object instead of a column. ` +
+                        `This indicates the reference function is returning the wrong type. ` +
+                        `Returned object keys: ${Object.keys(col || {}).join(', ')}. ` +
+                        `This is a bug - refFn must return a ColumnBuilder with .table property, not an FK object.`
+                    );
+                }
+                return col as ColumnBuilder;
+            }
+            
+            // If it's bound but doesn't have .table, that's an error
+            if (isBoundColumn(col) && !(col as any).table) {
+                throw new Error(
+                    `FK reference returned a bound column without .table property. ` +
+                    `This indicates the column is not properly associated with its table. ` +
+                    `Column name: ${(col as any).name || (col as any).config?.name || 'unknown'}, ` +
+                    `Column type: ${typeof col}, ` +
+                    `Column keys: ${Object.keys(col || {}).join(', ')}. ` +
+                    `This is a bug in column binding - columns from bound tables must have a .table property.`
+                );
+            }
+            
+            // If it's unbound, we need to find the table it belongs to and get the bound column
+            // Use the stored _refTableName and _refColumnName from the modifier (not from the column)
+            if (col instanceof UColumn) {
+                
+                // Look up the bound table and column using the table registry
+                // Use ONLY refTableName and refColumnName from the modifier - no fallbacks
+                if (!tableRegistry) {
+                    throw new Error(
+                        `FK reference function returned an unbound column but tableRegistry is not provided. ` +
+                        `refTableName: ${refTableName}, refColumnName: ${refColumnName}. ` +
+                        `This is required to look up the bound column. ` +
+                        `This causes Drizzle to create an explicit FK instead of an inline FK.`
+                    );
+                }
+                
+                // Find the unbound table by name, then get its bound version
+                let foundTable = false;
+                for (const [unboundTable, boundTable] of tableRegistry.entries()) {
+                    if (unboundTable.__name === refTableName) {
+                        foundTable = true;
+                        // Found the table! Get the bound column
+                        const boundCol = (boundTable as any)[refColumnName] || (boundTable as any).columns?.[refColumnName];
+                        if (!boundCol) {
+                            throw new Error(
+                                `Found bound table "${refTableName}" but column "${refColumnName}" not found. ` +
+                                `Bound table keys: ${Object.keys(boundTable || {}).slice(0, 20).join(', ')}. ` +
+                                `This indicates the column name doesn't match between unbound and bound tables.`
+                            );
+                        }
+                        // Verify it's a column, not an FK object
+                        if ((boundCol as any).foreignTable || (boundCol as any).foreignColumns) {
+                            throw new Error(
+                                `Found bound column "${refColumnName}" in table "${refTableName}" but it's a foreign key object, not a column. ` +
+                                `This indicates the table binding created an FK object instead of a column. ` +
+                                `This is a bug - table columns must be ColumnBuilder instances, not FK objects.`
+                            );
+                        }
+                        if (!isBoundColumn(boundCol)) {
+                            throw new Error(
+                                `Found column "${refColumnName}" in table "${refTableName}" but it's not a bound column. ` +
+                                `Type: ${typeof boundCol}, Keys: ${Object.keys(boundCol || {}).join(', ')}. ` +
+                                `This is a bug - bound columns must be ColumnBuilder instances.`
+                            );
+                        }
+                        if (!(boundCol as any).table) {
+                            throw new Error(
+                                `Found bound column "${refColumnName}" in table "${refTableName}" but it doesn't have .table property. ` +
+                                `This is a bug - bound columns must have .table property.`
+                            );
+                        }
+                        return boundCol as ColumnBuilder;
+                    }
+                }
+                
+                if (!foundTable) {
+                    // Table not found in registry
+                    const registryTableNames = Array.from(tableRegistry.keys()).map(t => (t as any).__name || 'unknown').join(', ');
+                    throw new Error(
+                        `Referenced table "${refTableName}" not found in table registry. ` +
+                        `Registry contains: ${registryTableNames || 'none'}. ` +
+                        `refColumnName: ${refColumnName}. ` +
+                        `This indicates the referenced table is not in the schema being bound, ` +
+                        `or the table name doesn't match. ` +
+                        `This causes Drizzle to create an explicit FK instead of an inline FK.`
+                    );
+                }
+            }
+            
+            // Unknown column type
+            throw new Error(
+                `FK reference returned an unknown column type: ${typeof col}, ` +
+                `Is UColumn: ${col instanceof UColumn}, ` +
+                `Column: ${JSON.stringify(col, (key, value) => {
+                    if (key === 'table' || key === '_' || key === '__table') return '[Table]';
+                    if (typeof value === 'function') return '[Function]';
+                    return value;
+                }, 2).substring(0, 300)}`
+            );
         };
         // Check if FK options were provided (second argument)
         const fkOptions = modifier.args.length > 1 ? modifier.args[1] : undefined;
+        
+        // IMPORTANT: builder.references(refFn) returns a NEW builder, not the column
+        // The refFn is stored by Drizzle and will be called later when extracting metadata
+        // refFn MUST return a ColumnBuilder with .table property, NOT the builder itself
+        // We verify refFn returns a column before passing it to Drizzle
+        let testRefResult: any;
+        try {
+            testRefResult = refFn();
+            if (!testRefResult || typeof testRefResult !== 'object') {
+                throw new Error(
+                    `refFn() returned invalid result: expected object (ColumnBuilder), got ${typeof testRefResult}. ` +
+                    `This indicates the reference function is broken.`
+                );
+            }
+            // Verify it's a column, not an FK object
+            if ((testRefResult as any).foreignTable || (testRefResult as any).foreignColumns) {
+                throw new Error(
+                    `refFn() returned a foreign key object instead of a column. ` +
+                    `This indicates the reference function is returning the wrong type. ` +
+                    `Returned object keys: ${Object.keys(testRefResult || {}).join(', ')}. ` +
+                    `This is a bug - refFn must return a ColumnBuilder with .table property, not an FK object.`
+                );
+            }
+            // Verify it has .table property (or will have it when bound)
+            if (!(testRefResult as any).table && !(testRefResult instanceof UColumn)) {
+                throw new Error(
+                    `refFn() returned an object without .table property and it's not a UColumn. ` +
+                    `This indicates the reference function is returning the wrong type. ` +
+                    `Returned object type: ${typeof testRefResult}, ` +
+                    `Is UColumn: ${testRefResult instanceof UColumn}, ` +
+                    `Keys: ${Object.keys(testRefResult || {}).join(', ')}. ` +
+                    `This is a bug - refFn must return a ColumnBuilder with .table property or a UColumn.`
+                );
+            }
+        } catch (error: any) {
+            throw new Error(
+                `Failed to validate refFn before passing to Drizzle: ${error.message}. ` +
+                `This indicates the FK reference function is broken. ` +
+                `Error: ${error.stack || error}`
+            );
+        }
+        
         if (fkOptions && typeof fkOptions === 'object') {
             // Drizzle's references() accepts options as second parameter
             builder = (builder.references as any)(refFn, fkOptions);
@@ -977,7 +1273,7 @@ export function unboundTable<
     }
   }
 
-  // Create the base table object
+  // Create the base table object first (we need it to set parent table on columns)
   // Wrap constraints callback to ensure it accepts UTable<any> for schema compatibility
   // At runtime, the actual table passed will be UTable<TColumns> with full type information
   const wrappedConstraints = constraints ? ((table: UTable<any>) => {
@@ -1015,6 +1311,18 @@ export function unboundTable<
     }
   }
 
+  // Set parent table reference on all UColumn instances BEFORE creating result
+  // This ensures that when columns are accessed via table.columnName, they have _parentTable set
+  // This is critical for FK resolution - columns need to know their parent table
+  for (const key in columns) {
+    if (!columns.hasOwnProperty(key)) continue;
+    const column = columns[key];
+    if (column instanceof UColumn) {
+      // We'll set _parentTable after creating result, but we need to ensure it's set
+      // The columns are the same object references whether accessed via columns[key] or result[key]
+    }
+  }
+
   // Create table object with columns exposed as properties
   // The types are computed at the type level using ComputeSelectType and ComputeInsertType
   // We use the original columns parameter directly to preserve literal types
@@ -1024,6 +1332,8 @@ export function unboundTable<
     // Expose columns as properties for use in references (e.g., usersTable.name)
     // Use the original columns parameter to preserve specific types
     // TypeScript will preserve the literal object type even with mixed column types
+    // NOTE: ...columns spreads the column objects - they are the SAME object references
+    // So setting _parentTable on columns[key] also sets it on result[key]
     ...columns,
     // Add $primaryKey getter that returns the primary key column
     // Type assertion is needed because runtime type doesn't match type-level inference
@@ -1031,6 +1341,53 @@ export function unboundTable<
       return primaryKeyColumn as GetPrimaryKeyColumn<TColumns>;
     },
   } as UTable<TColumns>;
+  
+  // Set parent table reference on all UColumn instances
+  // This allows columns to know which table they belong to for FK resolution
+  // Since ...columns spreads the same object references, setting _parentTable here
+  // will be visible when accessing columns via result.columnName
+  for (const key in columns) {
+    if (!columns.hasOwnProperty(key)) continue;
+    const column = columns[key];
+    if (column instanceof UColumn) {
+      (column as any)._parentTable = result;
+      // Verify it was set correctly - this should NEVER fail
+      if (!(column as any)._parentTable) {
+        throw new Error(
+          `Failed to set _parentTable on column "${column.getData().name}" in table "${name}". ` +
+          `_parentTable is still undefined after assignment. ` +
+          `This is a bug in table creation - all columns must have _parentTable set.`
+        );
+      }
+      if (!(column as any)._parentTable.__name) {
+        throw new Error(
+          `Failed to set _parentTable.__name on column "${column.getData().name}" in table "${name}". ` +
+          `_parentTable is set but __name is missing. ` +
+          `_parentTable type: ${typeof (column as any)._parentTable}, ` +
+          `_parentTable keys: ${Object.keys((column as any)._parentTable || {}).join(', ')}. ` +
+          `This is a bug in table creation - _parentTable must have __name property.`
+        );
+      }
+      // Also verify that accessing the column via result[key] has _parentTable set
+      // This ensures the spread operator preserved the object reference
+      const resultColumn = (result as any)[key];
+      if (resultColumn !== column) {
+        throw new Error(
+          `Column object reference mismatch in table "${name}" for column "${key}". ` +
+          `result[${key}] is not the same object as columns[${key}]. ` +
+          `This indicates the spread operator did not preserve object references. ` +
+          `This is a bug - columns must be the same object references.`
+        );
+      }
+      if (!(resultColumn as any)._parentTable || !(resultColumn as any)._parentTable.__name) {
+        throw new Error(
+          `Column "${key}" accessed via result[${key}] does not have _parentTable set correctly. ` +
+          `This indicates the spread operator did not preserve the _parentTable property. ` +
+          `This is a bug - columns accessed via table.columnName must have _parentTable set.`
+        );
+      }
+    }
+  }
   
   return result;
 }
@@ -1266,7 +1623,8 @@ function bindUniqueWithColumns(unique: UUnique, tableColumns: Record<string, any
  */
 export function bindTable(
   table: UTable<any> | Table,
-  dialect: SQLDialect
+  dialect: SQLDialect,
+  tableRegistry?: Map<UTable<any>, Table>
 ): Table {
   // Check if already bound
   if (!isUTable(table)) {
@@ -1303,7 +1661,7 @@ export function bindTable(
   // Bind all columns
   const boundColumns: Record<string, ColumnBuilder> = {};
   for (const [key, column] of Object.entries(unboundTable.columns)) {
-    boundColumns[key] = bindColumn(column as ColData, dialect);
+    boundColumns[key] = bindColumn(column as ColData, dialect, tableRegistry);
   }
 
   // Create the table using the dialect's table builder

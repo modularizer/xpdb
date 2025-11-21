@@ -383,7 +383,7 @@ export async function runSportsDBTest(
   const manCityPlayers = players.filter(p => p.teamId === manCityId);
   const liverpoolPlayers = players.filter(p => p.teamId === liverpoolId);
 
-  await db.gameStats.insert([
+  const gameStats = await db.gameStats.insert([
     // Game 1: Lakers vs Warriors
     { gameId: game1Id, playerId: lakersPlayers[0].id, points: 28, rebounds: 8, assists: 12, minutesPlayed: 38, fieldGoalsMade: 11, fieldGoalsAttempted: 22 },
     { gameId: game1Id, playerId: lakersPlayers[1].id, points: 22, rebounds: 10, assists: 3, minutesPlayed: 35, fieldGoalsMade: 9, fieldGoalsAttempted: 16 },
@@ -403,9 +403,9 @@ export async function runSportsDBTest(
     // Game 4: Man City vs Liverpool
     { gameId: game4Id, playerId: manCityPlayers[0].id, points: 1, rebounds: 0, assists: 0, minutesPlayed: 90, fieldGoalsMade: 1, fieldGoalsAttempted: 3 },
     { gameId: game4Id, playerId: liverpoolPlayers[0].id, points: 1, rebounds: 0, assists: 0, minutesPlayed: 90, fieldGoalsMade: 1, fieldGoalsAttempted: 4 },
-  ]);
+  ]).returning();
   
-  addLog('✅ Seeded 13 game stats', 'success');
+  addLog(`✅ Seeded ${gameStats.length} game stats`, 'success');
 
   // Step 10: Verify seeding
   addLog('🔍 Verifying seeded data...', 'log');
@@ -423,11 +423,15 @@ export async function runSportsDBTest(
   addLog(`   Game Stats: ${gameStatCount}`, 'log');
   addLog(`   Total Records: ${leagueCount + teamCount + playerCount + gameCount + gameStatCount}`, 'success');
 
-  if (leagueCount === 4 && teamCount === 9 && playerCount === 20 && gameCount === 4 && gameStatCount === 13) {
+  const expectedGameStatCount = gameStats.length;
+  if (leagueCount === 4 && teamCount === 9 && playerCount === 20 && gameCount === 4 && gameStatCount === expectedGameStatCount) {
     addLog('✅ All data seeded successfully!', 'success');
     addLog('🎉 Database is ready for browsing in xpdb-viewer!', 'success');
   } else {
     addLog('⚠️  Seeding verification: Some counts do not match expected values', 'log');
+    if (gameStatCount !== expectedGameStatCount) {
+      addLog(`   ⚠️  Game Stats: Expected ${expectedGameStatCount}, got ${gameStatCount}`, 'log');
+    }
   }
 }
 

@@ -452,6 +452,7 @@ async function getTableColumns(
         name: row.name,
         dataType: row.type || "unknown",
         isNullable: !row.notnull, // notnull: 1 => NOT NULL, 0 => NULLABLE
+        columnDefault: row.dflt_value || row.dfltValue || null,
     }));
     return info.map((row: ColumnInfo) => ({
         ...row,

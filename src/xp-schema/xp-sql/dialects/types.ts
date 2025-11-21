@@ -235,6 +235,7 @@ export interface ColumnInfo{
     name: string;
     dataType: string;
     isNullable: boolean;
+    columnDefault?: string | null; // column_default from information_schema.columns
 }
 export interface DrizzleColumnInfo extends ColumnInfo{
     drizzleColumn: any;

@@ -254,74 +254,76 @@ export function extractTableMetadata(
   unboundTable?: UTable<any>,
   allUnboundTables?: Record<string, UTable<any>>
 ): TableMetadata | Promise<TableMetadata> {
+  // Normalize dialect to always be a SQLDialect object
+  // If it's a string, resolve it to a dialect object (async)
+  const normalizeDialect = (): Promise<SQLDialect> => {
+    if (typeof dialect === 'string') {
+      return getDialectFromName(dialect);
+    }
+    return Promise.resolve(dialect);
+  };
+
   // If we have an unbound table, extract metadata from it first (dialect-agnostic)
   // Then merge with bound table's dialect-specific type information
   if (unboundTable) {
     const unboundMeta = extractTableMetadataFromUnbound(unboundTable, allUnboundTables);
-    // If dialect is a string, we need to get the dialect object (async)
-    // If it's already a SQLDialect object, use it directly
-    if (typeof dialect === 'string') {
-      return getDialectFromName(dialect).then(dialectObj => 
-        mergeUnboundWithBoundMetadata(unboundMeta, table, dialectObj)
-      );
-    } else {
-      return mergeUnboundWithBoundMetadata(unboundMeta, table, dialect);
-    }
+    return normalizeDialect().then(dialectObj => 
+      mergeUnboundWithBoundMetadata(unboundMeta, table, dialectObj)
+    );
   }
   
-  // Fallback: extract from bound table only (original method)
+  // Extract from bound table only
   // Validate table before processing
   if (!table || typeof table !== 'object') {
     throw new Error(`Invalid table: expected object, got ${typeof table}`);
   }
 
-  // Get table config using Drizzle's utility
-  let getTableConfig: any;
-  try {
-    if (dialect === 'pg') {
-      getTableConfig = require('drizzle-orm/pg-core').getTableConfig;
-    } else {
-      getTableConfig = require('drizzle-orm/sqlite-core').getTableConfig;
+  // Normalize dialect and extract metadata
+  return normalizeDialect().then(dialectObj => {
+    // Validate dialect has getTableConfig
+    if (!dialectObj.getTableConfig || typeof dialectObj.getTableConfig !== 'function') {
+      throw new Error(
+        `Dialect "${dialectObj.dialectName}" does not have a valid getTableConfig method`
+      );
     }
-  } catch (error: any) {
-    throw new Error(`Failed to load getTableConfig for dialect "${dialect}": ${error.message}`);
-  }
-  
-  // Validate getTableConfig function
-  if (typeof getTableConfig !== 'function') {
-    throw new Error(`getTableConfig is not a function for dialect "${dialect}"`);
-  }
 
-  let config: any;
-  try {
-    config = getTableConfig(table);
-  } catch (error: any) {
-    const tableName = getTableName(table);
-    throw new Error(
-      `Failed to get table config for table "${tableName}": ${error.message}. ` +
-      `Table type: ${typeof table}, has columns: ${!!(table as any).columns}, ` +
-      `table keys: ${Object.keys(table || {}).join(', ')}`
-    );
-  }
-
-  // Validate config
-  if (!config || typeof config !== 'object') {
-    const tableName = getTableName(table);
-    throw new Error(
-      `getTableConfig returned invalid config for table "${tableName}": expected object, got ${typeof config}`
-    );
-  }
-
-  const tableName = config.name || getTableName(table);
-  
-  // Debug: Log foreign keys in config
-  if (config.foreignKeys && Array.isArray(config.foreignKeys)) {
-    console.log(`   Table ${tableName} has ${config.foreignKeys.length} foreign key(s) in config.foreignKeys`);
-    for (let i = 0; i < config.foreignKeys.length; i++) {
-      const fk = config.foreignKeys[i];
-      console.log(`     FK ${i}: columns=${fk.columns?.length || 0}, hasReference=${!!fk.reference}`);
+    let config: any;
+    try {
+      config = dialectObj.getTableConfig(table);
+    } catch (error: any) {
+      const tableName = getTableName(table);
+      throw new Error(
+        `Failed to get table config for table "${tableName}": ${error.message}. ` +
+        `Table type: ${typeof table}, has columns: ${!!(table as any).columns}, ` +
+        `table keys: ${Object.keys(table || {}).join(', ')}`
+      );
     }
-  }
+
+    // Validate config
+    if (!config || typeof config !== 'object') {
+      const tableName = getTableName(table);
+      throw new Error(
+        `getTableConfig returned invalid config for table "${tableName}": expected object, got ${typeof config}`
+      );
+    }
+
+    const tableName = config.name || getTableName(table);
+    
+    // Continue with metadata extraction...
+    return extractMetadataFromConfig(config, tableName, dialectObj, table);
+  });
+}
+
+/**
+ * Extract metadata from a table config (internal helper)
+ */
+function extractMetadataFromConfig(
+  config: any,
+  tableName: string,
+  dialect: SQLDialect,
+  table: Table
+): TableMetadata {
+
   
   // Extract columns
   const columns: Record<string, ColumnMetadata> = {};
@@ -342,7 +344,7 @@ export function extractTableMetadata(
     const column = config.columns[key];
     if (column) {
       try {
-        const metadata = extractColumnMetadata(column, dialect);
+        const metadata = extractColumnMetadata(column, dialect.dialectName as 'sqlite' | 'pg');
         if (metadata.name) {
           columns[metadata.name] = metadata;
         } else {
@@ -378,37 +380,27 @@ export function extractTableMetadata(
   
   // First, check columns directly for inline foreign keys (defined with .references())
   // These might not be in config.foreignKeys
-  console.log(`   Checking ${columnKeys.length} columns for inline foreign keys...`);
+  // NOTE: config.columns contains bound Drizzle columns, NOT UColumn instances
+  // UColumn instances are always bound via bindColumn() before getTableConfig() is called
   for (const key of columnKeys) {
     const column = config.columns[key];
     if (!column || !column.name) continue;
     
-    // Check if column has a reference (inline foreign key)
-    // Try multiple ways to access the reference
-    let refFn: (() => any) | undefined;
-    
-    // Check various properties where the reference might be stored
-    if (column.references && typeof column.references === 'function') {
-      refFn = column.references;
-      console.log(`     Column "${column.name}" has column.references`);
-    } else if ((column as any).$ref && typeof (column as any).$ref === 'function') {
-      refFn = (column as any).$ref;
-      console.log(`     Column "${column.name}" has $ref`);
-    } else if ((column as any).ref && typeof (column as any).ref === 'function') {
-      refFn = (column as any).ref;
-      console.log(`     Column "${column.name}" has ref`);
-    } else if ((column as any).foreignKey && typeof (column as any).foreignKey === 'function') {
-      refFn = (column as any).foreignKey;
-      console.log(`     Column "${column.name}" has foreignKey`);
-    } else if ((column as any)._?.references && typeof (column as any)._?.references === 'function') {
-      refFn = (column as any)._?.references;
-      console.log(`     Column "${column.name}" has _.references`);
-    } else if ((column as any).data?.references && typeof (column as any).data?.references === 'function') {
-      refFn = (column as any).data?.references;
-      console.log(`     Column "${column.name}" has data.references`);
+    // Validate this is a bound Drizzle column, not a UColumn
+    // UColumn has getData() method, bound columns don't
+    if ((column as any).getData && typeof (column as any).getData === 'function') {
+      throw new Error(
+        `Column "${column.name}" in table "${tableName}" is a UColumn (unbound), but extractMetadataFromConfig expects bound Drizzle columns. ` +
+        `This indicates getTableConfig() returned unbound columns, which should never happen. ` +
+        `Tables must be bound via bindTable() before getTableConfig() is called. ` +
+        `This is a bug in the table binding process.`
+      );
     }
     
-    if (refFn) {
+    // Check if column has a reference (inline foreign key)
+    // Drizzle stores inline FKs as column.references (function) on bound columns
+    if (column.references && typeof column.references === 'function') {
+      const refFn = column.references;
       try {
         // Call the reference function to get the referenced column
         const refCol = refFn();
@@ -416,39 +408,31 @@ export function extractTableMetadata(
           let refTable = '';
           let refColumn = '';
           
-          // The referenced column should have a table property
-          // Try multiple ways to access it
-          const refColTable = (refCol as any).table || 
-                             (refCol as any)._?.table || 
-                             (refCol as any).__table ||
-                             (refCol as any).tableName;
+          // The referenced column should have a .table property (Drizzle standard)
+          const refColTable = (refCol as any).table;
           
-          if (refColTable) {
-            // Get table name from the referenced column's table
-            try {
-              refTable = getTableName(refColTable);
-            } catch (e) {
-              // Try alternative ways to get table name
-              refTable = (refColTable as any).name || 
-                        (refColTable as any).__name || 
-                        (refColTable as any).tableName ||
-                        '';
-            }
+          if (!refColTable) {
+            throw new Error(
+              `Column "${column.name}" in table "${tableName}" has a reference function, but the referenced column does not have a .table property. ` +
+              `This indicates the reference function returned an invalid column. ` +
+              `Referenced column type: ${typeof refCol}, keys: ${Object.keys(refCol || {}).join(', ')}. ` +
+              `This is a bug - Drizzle columns must have a .table property.`
+            );
           }
           
-          // Get the referenced column name - try multiple ways
-          refColumn = (refCol as any).name || 
-                     (refCol as any).data?.name || 
-                     (refCol as any).__name ||
-                     (refCol as any).columnName ||
-                     '';
+          // Get table name using Drizzle's getTableName utility
+          refTable = getTableName(refColTable);
           
-          // If we still don't have the column name, try to get it from the column's data
+          // Get the referenced column name - Drizzle columns have .name property
+          refColumn = (refCol as any).name;
+          
           if (!refColumn) {
-            const refColData = (refCol as any).data || (refCol as any).getData?.();
-            if (refColData) {
-              refColumn = refColData.name || refColData.columnName || '';
-            }
+            throw new Error(
+              `Column "${column.name}" in table "${tableName}" has a reference function, but the referenced column does not have a .name property. ` +
+              `This indicates the reference function returned an invalid column. ` +
+              `Referenced column type: ${typeof refCol}, keys: ${Object.keys(refCol || {}).join(', ')}. ` +
+              `This is a bug - Drizzle columns must have a .name property.`
+            );
           }
           
           console.log(`     Column "${column.name}" references: ${refTable}.${refColumn}`);
@@ -473,6 +457,9 @@ export function extractTableMetadata(
   }
   
   // Then, check config.foreignKeys for explicit foreign key constraints
+  // Note: Inline FKs (defined with .references()) appear in both config.columns (as column.references)
+  // and config.foreignKeys. We've already extracted them from columns above, so we should skip
+  // duplicates here.
   if (config.foreignKeys && Array.isArray(config.foreignKeys)) {
     for (const fk of config.foreignKeys) {
       let localColumns: string[] = [];
@@ -484,57 +471,151 @@ export function extractTableMetadata(
         localColumns = fk.columns.map((col: any) => col?.name || (typeof col === 'string' ? col : '')).filter((n: string) => n);
       }
       
-      // Get reference table and columns
-      if (fk.reference && typeof fk.reference === 'function') {
-        try {
-          // For inline FKs, reference() returns the referenced column, not the table
-          // For explicit FKs, reference() returns the referenced table
-          // Note: fk.reference() may trigger Drizzle's binding which can fail if column type is undefined
-          // We catch this and skip this FK - it will be handled by the inline FK extraction above
-          let refResult: any;
-          try {
-            refResult = fk.reference();
-          } catch (bindError: any) {
-            // If binding fails (e.g., "Column type undefined"), skip this FK
-            // It's likely an inline FK that was already processed above
-            if (bindError?.message?.includes('Column type') || bindError?.message?.includes('not found in dialect')) {
-              console.log(`     ⚠️  FK reference() failed during binding (likely inline FK already processed): ${bindError.message}`);
-              continue;
+      // Check if this FK is already extracted from inline column references
+      // If fk.columns is empty and we have a reference function, it's likely an inline FK
+      const isInlineFK = localColumns.length === 0 && fk.reference && typeof fk.reference === 'function';
+      if (isInlineFK) {
+        // Try to match this FK to an already-extracted inline FK by comparing reference functions
+        const alreadyExtracted = foreignKeys.some(existingFK => {
+          // Check if any column in this table has the same reference function
+          for (const key of columnKeys) {
+            const column = config.columns[key];
+            if (column && column.references === fk.reference) {
+              return true;
             }
-            throw bindError; // Re-throw if it's a different error
+          }
+          return false;
+        });
+        
+        if (alreadyExtracted) {
+          console.log(`     Skipping FK in config.foreignKeys (already extracted from inline column reference)`);
+          continue;
+        }
+      }
+      
+      // Get reference table and columns
+      // Drizzle stores foreign keys in config.foreignKeys with:
+      // - fk.columns: array of local columns (empty for inline FKs)
+      // - fk.reference: function that returns the referenced column/table
+      // - fk.foreignColumns: array of referenced columns (for explicit FKs)
+      if (!fk.reference || typeof fk.reference !== 'function') {
+        throw new Error(
+          `Foreign key in table "${tableName}" has invalid reference: expected function, got ${typeof fk.reference}. ` +
+          `FK structure: columns=${fk.columns?.length || 0}, foreignColumns=${fk.foreignColumns?.length || 0}`
+        );
+      }
+      
+      // Call fk.reference() to get the referenced column or table
+      // fk.reference should be a function that returns a column (for inline FKs)
+      // or a table (for explicit FKs)
+      if (typeof fk.reference !== 'function') {
+        throw new Error(
+          `Foreign key in table "${tableName}" has invalid reference: expected function, got ${typeof fk.reference}. ` +
+          `fk.reference type: ${typeof fk.reference}, ` +
+          `fk.reference value: ${JSON.stringify(fk.reference, (key, value) => {
+            if (typeof value === 'function') return '[Function]';
+            if (key === 'table' || key === '_' || key === '__table') return '[Table]';
+            return value;
+          }, 2).substring(0, 500)}. ` +
+          `This indicates the FK was not properly created - fk.reference must be a function.`
+        );
+      }
+      
+      let refResult: any = fk.reference();
+      
+      if (!refResult || typeof refResult !== 'object') {
+        throw new Error(
+          `fk.reference() returned invalid result for foreign key in table "${tableName}": ` +
+          `expected object (column or table), got ${typeof refResult}. ` +
+          `This indicates the FK reference is not properly configured.`
+        );
+      }
+      
+      // Check if refResult is a foreign key object (this should NEVER happen for inline FKs)
+      // If it is, it means Drizzle created an explicit FK instead of an inline FK
+      // This happens when refFn() returns something Drizzle doesn't recognize as a column
+      if ((refResult as any).foreignTable || (refResult as any).foreignColumns) {
+        // This is an explicit FK object - extract info from it
+        const fkObj = refResult as any;
+        if (fkObj.foreignTable && fkObj.foreignColumns && Array.isArray(fkObj.foreignColumns) && fkObj.foreignColumns.length > 0) {
+          // Get the referenced table name
+          try {
+            refTable = getTableName(fkObj.foreignTable);
+          } catch (e: any) {
+            throw new Error(
+              `fk.reference() returned a foreign key object but could not get table name from foreignTable. ` +
+              `This indicates the FK binding created an explicit FK instead of an inline FK. ` +
+              `Error: ${e.message}. ` +
+              `This is a bug - refFn should return a ColumnBuilder with .table property, not cause Drizzle to create an explicit FK.`
+            );
+          }
+          // Get the referenced column names
+          refColumns = fkObj.foreignColumns.map((col: any) => {
+            if (typeof col === 'string') return col;
+            if (col && typeof col === 'object' && col.name) return col.name;
+            if (col && typeof col === 'object' && col.config?.name) return col.config.name;
+            throw new Error(
+              `Invalid column in fk.foreignColumns: expected string or object with .name, got ${typeof col}. ` +
+              `Column value: ${JSON.stringify(col)}`
+            );
+          }).filter((n: string) => n.length > 0);
+          
+          // Get local columns from fk.columns
+          if (fkObj.columns && Array.isArray(fkObj.columns) && fkObj.columns.length > 0) {
+            localColumns = fkObj.columns.map((col: any) => {
+              if (typeof col === 'string') return col;
+              if (col && typeof col === 'object' && col.name) return col.name;
+              if (col && typeof col === 'object' && col.config?.name) return col.config.name;
+              return '';
+            }).filter((n: string) => n.length > 0);
           }
           
-          console.log(`     fk.reference() returned:`, {
-            type: typeof refResult,
-            isNull: refResult === null,
-            isUndefined: refResult === undefined,
-            keys: refResult ? Object.keys(refResult).slice(0, 10) : [],
-          });
-          
-          if (!refResult) {
-            console.log(`     ⚠️  fk.reference() returned null/undefined`);
-            continue;
+          // If we still don't have local columns, try to find them by matching the FK
+          if (localColumns.length === 0) {
+            // This is an explicit FK - we need to find which columns in this table match
+            // We can't reliably match explicit FKs to columns, so we'll skip it
+            // But we should log a warning
+            console.warn(
+              `FK in table "${tableName}" is an explicit FK (not inline) and could not be matched to columns. ` +
+              `This indicates refFn() returned something Drizzle didn't recognize as a column, ` +
+              `causing Drizzle to create an explicit FK instead of an inline FK. ` +
+              `This is a bug - refFn should return a ColumnBuilder with .table property.`
+            );
+            continue; // Skip this FK - we can't extract it properly
           }
           
-          // Check if it's a column (has .table property) or a table
-          const refColTable = (refResult as any).table || (refResult as any)._?.table || (refResult as any).__table;
-          
-          console.log(`     refColTable check:`, {
-            hasTable: !!refColTable,
-            hasTableProp: !!(refResult as any).table,
-            has_Table: !!(refResult as any)._?.table,
-            has__Table: !!(refResult as any).__table,
-          });
-          
-          if (refColTable) {
+          // Add the FK
+          const isDuplicate = foreignKeys.some(existing =>
+            existing.localColumns.length === localColumns.length &&
+            existing.localColumns.every((col, i) => col === localColumns[i]) &&
+            existing.refTable === refTable &&
+            existing.refColumns.length === refColumns.length &&
+            existing.refColumns.every((col, i) => col === refColumns[i])
+          );
+          if (!isDuplicate) {
+            foreignKeys.push({ localColumns, refTable, refColumns });
+          }
+          continue; // Skip the rest of the processing for this FK
+        } else {
+          throw new Error(
+            `fk.reference() returned a foreign key object but it's malformed. ` +
+            `Expected foreignTable and foreignColumns, got: ` +
+            `foreignTable: ${!!fkObj.foreignTable}, foreignColumns: ${Array.isArray(fkObj.foreignColumns) ? fkObj.foreignColumns.length : 'not array'}. ` +
+            `This is a bug - the FK object is incomplete.`
+          );
+        }
+      }
+      
+      // Drizzle columns have a .table property that points to their parent table
+      // If refResult has .table, it's a column reference (inline FK)
+      // If refResult doesn't have .table but has table-like properties, it's a table reference (explicit FK)
+      const refColTable = (refResult as any).table;
+      
+      if (refColTable) {
             // It's a column - extract table and column name
-            try {
               refTable = getTableName(refColTable);
               console.log(`     Extracted refTable from getTableName: ${refTable}`);
-            } catch (e) {
-              refTable = (refColTable as any).name || (refColTable as any).__name || '';
-              console.log(`     Extracted refTable from fallback: ${refTable}`);
-            }
+
             
             // Get the referenced column name
             refColumns = [(refResult as any).name || (refResult as any).data?.name || (refResult as any).__name || ''];
@@ -552,7 +633,7 @@ export function extractTableMetadata(
                 if (!column || !column.name) continue;
                 
                 // Check if column.references is the same function as fk.reference
-                if (column.references === fk.reference || (column as any).$ref === fk.reference) {
+                if (column.references && typeof column.references === 'function' && column.references === fk.reference) {
                   localColumns = [column.name];
                   console.log(`   ✅ Matched FK to column "${column.name}" by function reference`);
                   break;
@@ -567,42 +648,27 @@ export function extractTableMetadata(
                   if (!column || !column.name) continue;
                   
                   // Check if this column has a reference function that matches
-                  let colRefFn: (() => any) | undefined;
+                  // Drizzle stores inline FKs as column.references (function)
                   if (column.references && typeof column.references === 'function') {
-                    colRefFn = column.references;
-                  } else if ((column as any).$ref && typeof (column as any).$ref === 'function') {
-                    colRefFn = (column as any).$ref;
-                  } else if ((column as any).ref && typeof (column as any).ref === 'function') {
-                    colRefFn = (column as any).ref;
-                  }
-                  
-                  if (colRefFn) {
-                    try {
-                      const colRef = colRefFn();
-                      if (!colRef) continue;
+                    const colRefFn = column.references;
+                    const colRef = colRefFn();
+                    if (!colRef) continue;
+                    
+                    // Compare the referenced column/table to see if it matches
+                    // Drizzle columns have .table and .name properties
+                    const colRefTable = (colRef as any).table;
+                    const colRefName = (colRef as any).name;
+                    
+                    if (colRefTable && colRefName && refColTable) {
+                      const colRefTableName = getTableName(colRefTable);
                       
-                      // Compare the referenced column/table to see if it matches
-                      const colRefTable = (colRef as any).table || (colRef as any)._?.table || (colRef as any).__table;
-                      if (colRefTable && refColTable) {
-                        try {
-                          const colRefTableName = getTableName(colRefTable);
-                          const colRefName = (colRef as any).name || (colRef as any).data?.name || (colRef as any).__name || '';
-                          
-                          console.log(`     Checking column "${column.name}": refTable="${colRefTableName}", refCol="${colRefName}" vs expected "${refTable}"."${refColumns[0]}"`);
-                          
-                          if (colRefTableName === refTable && colRefName === refColumns[0]) {
-                            localColumns = [column.name];
-                            console.log(`   ✅ Matched FK to column "${column.name}" by reference result`);
-                            break;
-                          }
-                        } catch (e) {
-                          // Skip comparison if we can't get table name
-                          console.log(`     Error comparing for column "${column.name}":`, e);
-                        }
+                      console.log(`     Checking column "${column.name}": refTable="${colRefTableName}", refCol="${colRefName}" vs expected "${refTable}"."${refColumns[0]}"`);
+                      
+                      if (colRefTableName === refTable && colRefName === refColumns[0]) {
+                        localColumns = [column.name];
+                        console.log(`   ✅ Matched FK to column "${column.name}" by reference result`);
+                        break;
                       }
-                    } catch (e) {
-                      // Skip if reference() fails
-                      console.log(`     Error calling reference for column "${column.name}":`, e);
                     }
                   }
                 }
@@ -614,57 +680,57 @@ export function extractTableMetadata(
               }
             }
           } else {
-            // It's a table - explicit foreign key, OR refColTable check failed
-            console.log(`     refColTable is falsy, treating as table or trying alternative extraction`);
-            try {
-              refTable = getTableName(refResult);
-              console.log(`     Extracted refTable (as table): ${refTable}`);
-            } catch (e) {
-              console.log(`     Could not get table name from refResult:`, e);
-              // Try to extract from refResult directly
-              refTable = (refResult as any).name || (refResult as any).__name || '';
-              console.log(`     Extracted refTable from fallback: ${refTable}`);
+            // refResult doesn't have a .table property
+            // This means it's either:
+            // 1. A table object (for explicit FKs defined with foreignKey())
+            // 2. A malformed column that should have .table but doesn't (BUG)
+            
+            // For explicit FKs, Drizzle stores fk.foreignColumns with the referenced columns
+            if (!fk.foreignColumns || !Array.isArray(fk.foreignColumns) || fk.foreignColumns.length === 0) {
+              throw new Error(
+                `Foreign key in table "${tableName}" is malformed: ` +
+                `fk.reference() returned an object without .table property (not a column), ` +
+                `but fk.foreignColumns is missing or empty. ` +
+                `This indicates the FK is neither a valid inline FK (column with .table) nor a valid explicit FK (table with foreignColumns). ` +
+                `RefResult type: ${typeof refResult}, keys: ${refResult ? Object.keys(refResult).join(', ') : 'null'}, ` +
+                `RefResult constructor: ${refResult?.constructor?.name || 'unknown'}. ` +
+                `This is a bug in FK binding - the referenced column should have a .table property, ` +
+                `or if it's an explicit FK, fk.foreignColumns should be populated.`
+              );
             }
             
-            // Get foreign columns
-            if (fk.foreignColumns && Array.isArray(fk.foreignColumns) && fk.foreignColumns.length > 0) {
-              refColumns = fk.foreignColumns.map((col: any) => col?.name || (typeof col === 'string' ? col : '')).filter((n: string) => n);
-              console.log(`     Using fk.foreignColumns: ${refColumns.join(', ')}`);
-            } else {
-              // Fallback: use primary key of referenced table
-              try {
-                const refTableConfig = getTableConfig(refResult, dialect);
-                if (refTableConfig.primaryKeys && refTableConfig.primaryKeys.length > 0) {
-                  refColumns = refTableConfig.primaryKeys.map((pk: any) => {
-                    return pk?.name || pk?.column?.name || (typeof pk === 'string' ? pk : '');
-                  }).filter((n: string) => n);
-                  console.log(`     Using primary keys from refTable: ${refColumns.join(', ')}`);
-                } else {
-                  // If it's actually a column, try to get the column name
-                  const colName = (refResult as any).name || (refResult as any).data?.name || (refResult as any).__name || '';
-                  if (colName) {
-                    refColumns = [colName];
-                    console.log(`     Using column name from refResult: ${colName}`);
-                  }
-                }
-              } catch (e2) {
-                console.log(`     Error getting refTableConfig:`, e2);
-                // Last resort: try to get column name from refResult
-                const colName = (refResult as any).name || (refResult as any).data?.name || (refResult as any).__name || '';
-                if (colName) {
-                  refColumns = [colName];
-                  console.log(`     Using column name from refResult (fallback): ${colName}`);
-                }
+            // This is an explicit FK - fk.reference() should return the table
+            refTable = getTableName(refResult);
+            
+            if (!refTable) {
+              throw new Error(
+                `fk.reference() returned a table object but getTableName() returned undefined for foreign key in table "${tableName}". ` +
+                `This is a bug in Drizzle's table structure.`
+              );
+            }
+            
+            // Use fk.foreignColumns as the authoritative source for explicit FKs
+            refColumns = fk.foreignColumns.map((col: any) => {
+              if (typeof col === 'string') {
+                return col;
               }
+              if (col && typeof col === 'object' && col.name) {
+                return col.name;
+              }
+              throw new Error(
+                `Invalid column in fk.foreignColumns for foreign key in table "${tableName}": ` +
+                `expected string or object with .name, got ${typeof col}. ` +
+                `Column value: ${JSON.stringify(col)}`
+              );
+            }).filter((n: string) => n.length > 0);
+            
+            if (refColumns.length === 0) {
+              throw new Error(
+                `fk.foreignColumns is empty or contains no valid column names for foreign key in table "${tableName}". ` +
+                `This FK cannot be properly extracted.`
+              );
             }
           }
-        } catch (e) {
-          // Skip if we can't resolve
-          console.warn(`     ⚠️  Error processing FK reference:`, e);
-        }
-      } else {
-        console.log(`     ⚠️  FK has no reference function`);
-      }
       
       // Add the foreign key if we have all required information
       // Check if this FK is already added (from inline reference check above)
@@ -705,6 +771,21 @@ export function extractTableMetadata(
       if (unique?.columns && Array.isArray(unique.columns)) {
         const uniqueColumns = unique.columns.map((col: any) => col?.name || (typeof col === 'string' ? col : '')).filter((n: string) => n);
         if (uniqueColumns.length > 0) {
+          // Validate constraint name if provided
+          if (unique.name) {
+            if (!/^[A-Za-z0-9_$]+$/.test(unique.name)) {
+              const invalidChars = unique.name.split('').filter(c => !/^[A-Za-z0-9_$]$/.test(c));
+              const uniqueInvalidChars = [...new Set(invalidChars)];
+              throw new Error(
+                `Invalid unique constraint name "${unique.name}" in table "${tableName}": ` +
+                `contains invalid characters: ${uniqueInvalidChars.map(c => `"${c}"`).join(', ')}. ` +
+                `Constraint names must only contain alphanumeric characters, underscores, and dollar signs. ` +
+                `This constraint was defined in the schema with an invalid name. ` +
+                `The constraint name must be fixed in the schema definition.`
+              );
+            }
+          }
+          
           const key = uniqueColumns.sort().join(',');
           // For single-column unique, check if already added as inline
           if (uniqueColumns.length === 1) {
@@ -755,6 +836,19 @@ export function extractTableMetadata(
     const indexName = idx.config?.name || idx.name || idx._?.name || '';
     if (!indexName) continue;
     
+    // Validate index name
+    if (!/^[A-Za-z0-9_$]+$/.test(indexName)) {
+      const invalidChars = indexName.split('').filter(c => !/^[A-Za-z0-9_$]$/.test(c));
+      const uniqueInvalidChars = [...new Set(invalidChars)];
+      throw new Error(
+        `Invalid index name "${indexName}" in table "${tableName}": ` +
+        `contains invalid characters: ${uniqueInvalidChars.map(c => `"${c}"`).join(', ')}. ` +
+        `Index names must only contain alphanumeric characters, underscores, and dollar signs. ` +
+        `This index was defined in the schema with an invalid name. ` +
+        `The index name must be fixed in the schema definition.`
+      );
+    }
+    
     const indexColumns: string[] = [];
     const idxColumns = idx.config?.columns || idx.columns;
     if (idxColumns && Array.isArray(idxColumns)) {
@@ -788,6 +882,53 @@ export function compareTables(
   oldTable: TableMetadata,
   newTable: TableMetadata
 ): SchemaDiff['modifiedTables'][0] | null {
+  // Validate inputs
+  if (!oldTable || typeof oldTable !== 'object') {
+    throw new Error(
+      `Cannot compare tables: oldTable is invalid. ` +
+      `Expected TableMetadata object, got ${typeof oldTable}`
+    );
+  }
+  
+  if (!newTable || typeof newTable !== 'object') {
+    throw new Error(
+      `Cannot compare tables: newTable is invalid. ` +
+      `Expected TableMetadata object, got ${typeof newTable}`
+    );
+  }
+  
+  // Ensure both tables have valid columns objects
+  const oldColumns = oldTable.columns && typeof oldTable.columns === 'object' 
+    ? oldTable.columns 
+    : {};
+  const newColumns = newTable.columns && typeof newTable.columns === 'object'
+    ? newTable.columns
+    : {};
+  
+  // If either table has no columns, treat as empty
+  if (Object.keys(oldColumns).length === 0 && Object.keys(newColumns).length === 0) {
+    // Both tables are empty - no changes
+    return null;
+  }
+  
+  if (Object.keys(oldColumns).length === 0 || Object.keys(newColumns).length === 0) {
+    // One table is empty - this is a significant change, but we can't compare columns
+    // Return a diff indicating all columns are added/removed
+    const changes: SchemaDiff['modifiedTables'][0] = {
+      tableName: newTable.name || oldTable.name || 'unknown',
+      addedColumns: Object.keys(newColumns),
+      removedColumns: Object.keys(oldColumns),
+      modifiedColumns: [],
+      addedForeignKeys: [],
+      removedForeignKeys: [],
+      addedUniqueConstraints: [],
+      removedUniqueConstraints: [],
+      addedIndexes: [],
+      removedIndexes: [],
+    };
+    return changes;
+  }
+  
   const changes: SchemaDiff['modifiedTables'][0] = {
     tableName: newTable.name,
     addedColumns: [],
@@ -801,9 +942,9 @@ export function compareTables(
     removedIndexes: [],
   };
   
-  // Compare columns
-  const oldColumnNames = new Set(Object.keys(oldTable.columns));
-  const newColumnNames = new Set(Object.keys(newTable.columns));
+  // Compare columns (using the validated columns objects)
+  const oldColumnNames = new Set(Object.keys(oldColumns));
+  const newColumnNames = new Set(Object.keys(newColumns));
   
   // Added columns
   for (const colName of newColumnNames) {
@@ -974,27 +1115,62 @@ export function compareTables(
           // Compare default value - handle functions specially
           if (oldCol.hasDefault !== newCol.hasDefault) {
             columnChanges.push(`hasDefault: ${oldCol.hasDefault} -> ${newCol.hasDefault}`);
+            console.log(`[compareTables] Column "${colName}" in table "${oldTable.name}": hasDefault changed from ${oldCol.hasDefault} to ${newCol.hasDefault}`);
           }
           // Compare actual default values
           if (oldCol.hasDefault && newCol.hasDefault) {
             const oldDefault = oldCol.defaultValue;
             const newDefault = newCol.defaultValue;
             
+            // Helper to normalize default values for comparison
+            const normalizeDefault = (val: any): string => {
+              if (val === undefined || val === null) return 'undefined';
+              if (typeof val === 'function') return 'function';
+              
+              // Check if it's a SQL expression object
+              if (val && typeof val === 'object' && val.type === 'sql' && val.queryChunks) {
+                // Extract SQL string from queryChunks
+                const sqlParts = val.queryChunks.map((chunk: any) => {
+                  if (chunk.value) {
+                    return Array.isArray(chunk.value) ? chunk.value.join(' ') : chunk.value;
+                  }
+                  return '';
+                }).filter((s: string) => s).join(' ');
+                return `sql:${sqlParts}`;
+              }
+              
+              // For strings, check if it looks like a SQL expression (CURRENT_TIMESTAMP, etc.)
+              if (typeof val === 'string') {
+                const sqlKeywords = ['CURRENT_TIMESTAMP', 'CURRENT_TIME', 'CURRENT_DATE', 'NOW()', 'LOCALTIME', 'LOCALTIMESTAMP'];
+                if (sqlKeywords.some(keyword => val.toUpperCase().includes(keyword))) {
+                  return `sql:${val}`;
+                }
+              }
+              
+              // For other types, convert to string
+              return String(val);
+            };
+            
             // Both are functions - consider them equivalent (can't reliably compare function code)
             // Functions are typically serialized differently, so we ignore function-to-function changes
             if (typeof oldDefault === 'function' && typeof newDefault === 'function') {
               // Functions are considered equivalent - don't report as change
               // The function code might be serialized differently but represent the same function
-            } else if (typeof oldDefault !== 'function' && typeof newDefault !== 'function') {
-              // Both are non-function values - compare them
-              const oldDefaultStr = oldDefault !== undefined ? String(oldDefault) : 'undefined';
-              const newDefaultStr = newDefault !== undefined ? String(newDefault) : 'undefined';
-              if (oldDefaultStr !== newDefaultStr) {
-                columnChanges.push(`defaultValue: ${oldDefaultStr} -> ${newDefaultStr}`);
-              }
             } else {
-              // One is function, one is not - this is a real change
-              columnChanges.push(`defaultValue: ${typeof oldDefault === 'function' ? 'function' : String(oldDefault)} -> ${typeof newDefault === 'function' ? 'function' : String(newDefault)}`);
+              // Normalize both defaults and compare
+              const oldDefaultNormalized = normalizeDefault(oldDefault);
+              const newDefaultNormalized = normalizeDefault(newDefault);
+              
+              if (oldDefaultNormalized !== newDefaultNormalized) {
+                // Only report as change if they're actually different after normalization
+                // This handles cases where SQL expressions are stored differently (object vs string)
+                console.log(`[compareTables] Column "${colName}" in table "${oldTable.name}": defaultValue mismatch`);
+                console.log(`  Old (raw): ${JSON.stringify(oldDefault)}`);
+                console.log(`  New (raw): ${JSON.stringify(newDefault)}`);
+                console.log(`  Old (normalized): ${oldDefaultNormalized}`);
+                console.log(`  New (normalized): ${newDefaultNormalized}`);
+                columnChanges.push(`defaultValue: ${oldDefaultNormalized} -> ${newDefaultNormalized}`);
+              }
             }
           }
           
@@ -1028,17 +1204,25 @@ export function compareTables(
   }
   
   // Compare unique constraints
-  const oldUniques = new Set(oldTable.uniqueConstraints.map(u => JSON.stringify(u)));
-  const newUniques = new Set(newTable.uniqueConstraints.map(u => JSON.stringify(u)));
+  // Normalize by comparing only columns (sorted), ignoring names
+  // This handles cases where one has a name (from database) and the other doesn't (from schema)
+  const normalizeUniqueConstraint = (u: { name?: string; columns: string[] }): string => {
+    // Sort columns for consistent comparison
+    const sortedColumns = [...u.columns].sort().join(',');
+    return sortedColumns;
+  };
+  
+  const oldUniques = new Set(oldTable.uniqueConstraints.map(u => normalizeUniqueConstraint(u)));
+  const newUniques = new Set(newTable.uniqueConstraints.map(u => normalizeUniqueConstraint(u)));
   
   for (const u of newTable.uniqueConstraints) {
-    if (!oldUniques.has(JSON.stringify(u))) {
+    if (!oldUniques.has(normalizeUniqueConstraint(u))) {
       changes.addedUniqueConstraints.push(u);
     }
   }
   
   for (const u of oldTable.uniqueConstraints) {
-    if (!newUniques.has(JSON.stringify(u))) {
+    if (!newUniques.has(normalizeUniqueConstraint(u))) {
       changes.removedUniqueConstraints.push(u);
     }
   }

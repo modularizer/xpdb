@@ -180,13 +180,23 @@ function generateColumnSQLFromMetadata(
 
 /**
  * Generate CREATE TABLE SQL from table metadata
+ * 
+ * @param tableName - Name of the table to create
+ * @param tableMetadata - Metadata for the table
+ * @param dialect - SQL dialect ('sqlite' | 'pg')
+ * @param options - Options for SQL generation
+ * @param snapshot - Schema snapshot (required). Use `null` to indicate no snapshot provided, 
+ *                   or a snapshot with `tables: {}` to indicate an empty database.
+ *                   An empty database snapshot (`tables: {}`) is distinguishable from `null`:
+ *                   - `null` = no snapshot provided (will throw error for FK validation)
+ *                   - `tables: {}` = empty database snapshot (will validate FKs and fail if referenced table doesn't exist)
  */
 export function generateCreateTableFromSnapshot(
   tableName: string,
   tableMetadata: TableMetadata,
   dialect: 'sqlite' | 'pg',
   options: { ifNotExists?: boolean } = {},
-  snapshot?: SchemaSnapshot
+  snapshot: SchemaSnapshot | null
 ): string {
   const generator = getSQLGenerator(dialect);
   const columnDefs: string[] = [];
@@ -216,6 +226,18 @@ export function generateCreateTableFromSnapshot(
     const uniqueColumns = unique.columns.map(name => `"${name}"`).join(', ');
     if (uniqueColumns) {
       if (unique.name) {
+        // Validate constraint name before using it
+        if (!/^[A-Za-z0-9_$]+$/.test(unique.name)) {
+          const invalidChars = unique.name.split('').filter(c => !/^[A-Za-z0-9_$]$/.test(c));
+          const uniqueInvalidChars = [...new Set(invalidChars)];
+          throw new Error(
+            `Invalid unique constraint name "${unique.name}" in table "${tableName}": ` +
+            `contains invalid characters: ${uniqueInvalidChars.map(c => `"${c}"`).join(', ')}. ` +
+            `Constraint names must only contain alphanumeric characters, underscores, and dollar signs. ` +
+            `This constraint was extracted from the schema with an invalid name. ` +
+            `The constraint name must be fixed in the schema definition or database.`
+          );
+        }
         columnDefs.push(`CONSTRAINT "${unique.name}" UNIQUE (${uniqueColumns})`);
       } else {
         columnDefs.push(`UNIQUE (${uniqueColumns})`);
@@ -229,55 +251,64 @@ export function generateCreateTableFromSnapshot(
     const refColumns = fk.refColumns.map(name => `"${name}"`).join(', ');
     if (localColumns && refColumns) {
       // Validate: foreign key must reference a primary key or unique column
-      if (snapshot) {
-        const refTableMetadata = snapshot.tables[fk.refTable];
-        if (!refTableMetadata) {
-          throw new Error(
-            `Foreign key from table "${tableName}" references table "${fk.refTable}" which does not exist in the schema. ` +
-            `Foreign key: ${localColumns} -> ${fk.refTable}(${refColumns})`
-          );
-        }
-        
-        const refTablePKs = refTableMetadata.primaryKeys;
-        const refTableUniques = refTableMetadata.uniqueConstraints.flatMap(u => u.columns);
-        
-        // Check if all refColumns are either primary keys or unique
-        const allRefColsAreValid = fk.refColumns.every(col => 
-          refTablePKs.includes(col) || refTableUniques.includes(col)
-        );
-        
-        if (!allRefColsAreValid) {
-          const invalidColumns = fk.refColumns.filter(col => 
-            !refTablePKs.includes(col) && !refTableUniques.includes(col)
-          );
-          throw new Error(
-            `Invalid foreign key in table "${tableName}": ` +
-            `Foreign key ${localColumns} references "${fk.refTable}"(${refColumns}), ` +
-            `but column(s) ${invalidColumns.map(c => `"${c}"`).join(', ')} in "${fk.refTable}" are not primary keys or unique. ` +
-            `Foreign keys must reference primary keys or unique columns. ` +
-            `Referenced table "${fk.refTable}" has primary key: [${refTablePKs.map(c => `"${c}"`).join(', ')}] ` +
-            `and unique columns: [${refTableUniques.map(c => `"${c}"`).join(', ')}]`
-          );
-        }
-        
-        let fkSQL = `FOREIGN KEY (${localColumns}) REFERENCES "${fk.refTable}" (${refColumns})`;
-        
-        // Add ON UPDATE and ON DELETE if specified
-        if (fk.onUpdate) {
-          fkSQL += ` ON UPDATE ${fk.onUpdate}`;
-        }
-        if (fk.onDelete) {
-          fkSQL += ` ON DELETE ${fk.onDelete}`;
-        }
-        
-        columnDefs.push(fkSQL);
-      } else {
-        // No snapshot provided - validate later or throw error
+      // snapshot is required - null means no snapshot provided, empty object means empty database
+      if (snapshot === null) {
+        // No snapshot provided - cannot validate FK
         throw new Error(
-          `Cannot validate foreign key from table "${tableName}": snapshot not provided. ` +
-          `Foreign key: ${localColumns} -> ${fk.refTable}(${refColumns})`
+          `Cannot validate foreign key from table "${tableName}": snapshot not provided (null). ` +
+          `Foreign key: ${localColumns} -> ${fk.refTable}(${refColumns}). ` +
+          `A snapshot must be provided to validate foreign keys. ` +
+          `Use a snapshot with tables: {} to indicate an empty database.`
         );
       }
+      
+      // snapshot is provided - check if referenced table exists
+      // If snapshot.tables is empty ({}), this will fail, which is correct for an empty database
+      const refTableMetadata = snapshot.tables[fk.refTable];
+      if (!refTableMetadata) {
+        const isEmptyDatabase = Object.keys(snapshot.tables).length === 0;
+        throw new Error(
+          `Foreign key from table "${tableName}" references table "${fk.refTable}" which does not exist in the schema. ` +
+          `Foreign key: ${localColumns} -> ${fk.refTable}(${refColumns}). ` +
+          (isEmptyDatabase 
+            ? `The snapshot represents an empty database (tables: {}), so the referenced table "${fk.refTable}" does not exist.`
+            : `The referenced table "${fk.refTable}" is not in the snapshot tables: [${Object.keys(snapshot.tables).join(', ')}].`)
+        );
+      }
+      
+      const refTablePKs = refTableMetadata.primaryKeys;
+      const refTableUniques = refTableMetadata.uniqueConstraints.flatMap(u => u.columns);
+      
+      // Check if all refColumns are either primary keys or unique
+      const allRefColsAreValid = fk.refColumns.every(col => 
+        refTablePKs.includes(col) || refTableUniques.includes(col)
+      );
+      
+      if (!allRefColsAreValid) {
+        const invalidColumns = fk.refColumns.filter(col => 
+          !refTablePKs.includes(col) && !refTableUniques.includes(col)
+        );
+        throw new Error(
+          `Invalid foreign key in table "${tableName}": ` +
+          `Foreign key ${localColumns} references "${fk.refTable}"(${refColumns}), ` +
+          `but column(s) ${invalidColumns.map(c => `"${c}"`).join(', ')} in "${fk.refTable}" are not primary keys or unique. ` +
+          `Foreign keys must reference primary keys or unique columns. ` +
+          `Referenced table "${fk.refTable}" has primary key: [${refTablePKs.map(c => `"${c}"`).join(', ')}] ` +
+          `and unique columns: [${refTableUniques.map(c => `"${c}"`).join(', ')}]`
+        );
+      }
+      
+      let fkSQL = `FOREIGN KEY (${localColumns}) REFERENCES "${fk.refTable}" (${refColumns})`;
+      
+      // Add ON UPDATE and ON DELETE if specified
+      if (fk.onUpdate) {
+        fkSQL += ` ON UPDATE ${fk.onUpdate}`;
+      }
+      if (fk.onDelete) {
+        fkSQL += ` ON DELETE ${fk.onDelete}`;
+      }
+      
+      columnDefs.push(fkSQL);
     }
   }
   
@@ -363,6 +394,18 @@ export function generateCreateScriptFromSnapshot(
     if (tableMetadata.indexes && Array.isArray(tableMetadata.indexes) && tableMetadata.indexes.length > 0) {
       for (const idx of tableMetadata.indexes) {
         if (idx.name && idx.columns && idx.columns.length > 0) {
+          // Validate index name before using it
+          if (!/^[A-Za-z0-9_$]+$/.test(idx.name)) {
+            const invalidChars = idx.name.split('').filter(c => !/^[A-Za-z0-9_$]$/.test(c));
+            const uniqueInvalidChars = [...new Set(invalidChars)];
+            throw new Error(
+              `Invalid index name "${idx.name}" in table "${tableName}": ` +
+              `contains invalid characters: ${uniqueInvalidChars.map(c => `"${c}"`).join(', ')}. ` +
+              `Index names must only contain alphanumeric characters, underscores, and dollar signs. ` +
+              `This index was extracted from the schema with an invalid name. ` +
+              `The index name must be fixed in the schema definition or database.`
+            );
+          }
           const indexColumns = idx.columns.map(name => `"${name}"`).join(', ');
           const uniqueClause = idx.unique ? 'UNIQUE ' : '';
           statements.push(`CREATE ${uniqueClause}INDEX IF NOT EXISTS "${idx.name}" ON "${tableName}" (${indexColumns});`);
@@ -397,11 +440,12 @@ export function generateMigrationFromSnapshotDiff(
     statements.push(`DROP TABLE IF EXISTS "${tableName}";`);
   }
   
-  // Handle added tables - generate CREATE TABLE from snapshot
+    // Handle added tables - generate CREATE TABLE from snapshot
   for (const tableName of diff.addedTables) {
     const tableMetadata = newSnapshot.tables[tableName];
     if (tableMetadata) {
-      const createSQL = generateCreateTableFromSnapshot(tableName, tableMetadata, dialect, { ifNotExists: false });
+      // Pass newSnapshot for FK validation
+      const createSQL = generateCreateTableFromSnapshot(tableName, tableMetadata, dialect, { ifNotExists: false }, newSnapshot);
       statements.push(createSQL);
     }
   }
@@ -486,6 +530,18 @@ export function generateMigrationFromSnapshotDiff(
         if (tableMetadata.indexes && Array.isArray(tableMetadata.indexes) && tableMetadata.indexes.length > 0) {
           for (const idx of tableMetadata.indexes) {
             if (idx.name && idx.columns && idx.columns.length > 0) {
+              // Validate index name before using it
+              if (!/^[A-Za-z0-9_$]+$/.test(idx.name)) {
+                const invalidChars = idx.name.split('').filter(c => !/^[A-Za-z0-9_$]$/.test(c));
+                const uniqueInvalidChars = [...new Set(invalidChars)];
+                throw new Error(
+                  `Invalid index name "${idx.name}" in table "${tableName}": ` +
+                  `contains invalid characters: ${uniqueInvalidChars.map(c => `"${c}"`).join(', ')}. ` +
+                  `Index names must only contain alphanumeric characters, underscores, and dollar signs. ` +
+                  `This index was extracted from the schema with an invalid name. ` +
+                  `The index name must be fixed in the schema definition or database.`
+                );
+              }
               const indexColumns = idx.columns.map(name => `"${name}"`).join(', ');
               const uniqueClause = idx.unique ? 'UNIQUE ' : '';
               statements.push(`CREATE ${uniqueClause}INDEX IF NOT EXISTS "${idx.name}" ON "${tableName}" (${indexColumns});`);
@@ -543,8 +599,22 @@ export function generateMigrationFromSnapshotDiff(
             // Also need to update CHECK constraint if enum values changed
             if (col.enumValues && Array.isArray(col.enumValues) && col.enumValues.length > 0) {
               const enumStr = col.enumValues.map((v: any) => `'${String(v).replace(/'/g, "''")}'`).join(',');
-              statements.push(`ALTER TABLE "${tableName}" DROP CONSTRAINT IF EXISTS "${tableName}_${col.name}_check";`);
-              statements.push(`ALTER TABLE "${tableName}" ADD CONSTRAINT "${tableName}_${col.name}_check" CHECK ("${col.name}" IN (${enumStr}));`);
+              // Generate constraint name and validate it
+              const constraintName = `${tableName}_${col.name}_check`;
+              // Validate constraint name - throw error if invalid
+              if (!/^[A-Za-z0-9_$]+$/.test(constraintName)) {
+                const invalidChars = constraintName.split('').filter(c => !/^[A-Za-z0-9_$]$/.test(c));
+                const uniqueInvalidChars = [...new Set(invalidChars)];
+                throw new Error(
+                  `Invalid CHECK constraint name "${constraintName}" for table "${tableName}" column "${col.name}": ` +
+                  `contains invalid characters: ${uniqueInvalidChars.map(c => `"${c}"`).join(', ')}. ` +
+                  `Constraint names must only contain alphanumeric characters, underscores, and dollar signs. ` +
+                  `This constraint name was generated from table name "${tableName}" and column name "${col.name}". ` +
+                  `One of these names contains invalid characters.`
+                );
+              }
+              statements.push(`ALTER TABLE "${tableName}" DROP CONSTRAINT IF EXISTS "${constraintName}";`);
+              statements.push(`ALTER TABLE "${tableName}" ADD CONSTRAINT "${constraintName}" CHECK ("${col.name}" IN (${enumStr}));`);
             }
             handledChangeStrings.add(change);
             handledChangeTypes.add('enumValues');
@@ -639,15 +709,25 @@ export function generateMigrationFromSnapshotDiff(
       const localColumns = fk.localColumns.map(name => `"${name}"`).join(', ');
       const refColumns = fk.refColumns.map(name => `"${name}"`).join(', ');
       if (localColumns && refColumns) {
+        // Get onUpdate and onDelete from the snapshot's table metadata
+        const tableMeta = newSnapshot.tables[tableName];
+        const fullFk = tableMeta?.foreignKeys.find(f => 
+          f.localColumns.length === fk.localColumns.length &&
+          f.localColumns.every((col, i) => col === fk.localColumns[i]) &&
+          f.refTable === fk.refTable &&
+          f.refColumns.length === fk.refColumns.length &&
+          f.refColumns.every((col, i) => col === fk.refColumns[i])
+        );
+        
         let fkSQL = `ALTER TABLE "${tableName}" ADD FOREIGN KEY (${localColumns}) REFERENCES "${fk.refTable}" (${refColumns})`;
         
         // Add ON UPDATE and ON DELETE if specified (normalize to uppercase for SQL)
-        if (fk.onUpdate) {
-          const onUpdate = typeof fk.onUpdate === 'string' ? fk.onUpdate.toUpperCase() : fk.onUpdate;
+        if (fullFk?.onUpdate) {
+          const onUpdate = typeof fullFk.onUpdate === 'string' ? fullFk.onUpdate.toUpperCase() : fullFk.onUpdate;
           fkSQL += ` ON UPDATE ${onUpdate}`;
         }
-        if (fk.onDelete) {
-          const onDelete = typeof fk.onDelete === 'string' ? fk.onDelete.toUpperCase() : fk.onDelete;
+        if (fullFk?.onDelete) {
+          const onDelete = typeof fullFk.onDelete === 'string' ? fullFk.onDelete.toUpperCase() : fullFk.onDelete;
           fkSQL += ` ON DELETE ${onDelete}`;
         }
         
@@ -658,6 +738,18 @@ export function generateMigrationFromSnapshotDiff(
     // Handle removed unique constraints
     for (const unique of tableDiff.removedUniqueConstraints) {
       if (unique.name) {
+        // Validate constraint name before using it
+        if (!/^[A-Za-z0-9_$]+$/.test(unique.name)) {
+          const invalidChars = unique.name.split('').filter(c => !/^[A-Za-z0-9_$]$/.test(c));
+          const uniqueInvalidChars = [...new Set(invalidChars)];
+          throw new Error(
+            `Invalid unique constraint name "${unique.name}" in table "${tableName}": ` +
+            `contains invalid characters: ${uniqueInvalidChars.map(c => `"${c}"`).join(', ')}. ` +
+            `Constraint names must only contain alphanumeric characters, underscores, and dollar signs. ` +
+            `This constraint was extracted from the schema with an invalid name. ` +
+            `The constraint name must be fixed in the schema definition or database.`
+          );
+        }
         statements.push(`ALTER TABLE "${tableName}" DROP CONSTRAINT IF EXISTS "${unique.name}";`);
       } else {
         // Generate constraint name
@@ -671,6 +763,18 @@ export function generateMigrationFromSnapshotDiff(
       const uniqueColumns = unique.columns.map(name => `"${name}"`).join(', ');
       if (uniqueColumns) {
         if (unique.name) {
+          // Validate constraint name before using it
+          if (!/^[A-Za-z0-9_$]+$/.test(unique.name)) {
+            const invalidChars = unique.name.split('').filter(c => !/^[A-Za-z0-9_$]$/.test(c));
+            const uniqueInvalidChars = [...new Set(invalidChars)];
+            throw new Error(
+              `Invalid unique constraint name "${unique.name}" in table "${tableName}": ` +
+              `contains invalid characters: ${uniqueInvalidChars.map(c => `"${c}"`).join(', ')}. ` +
+              `Constraint names must only contain alphanumeric characters, underscores, and dollar signs. ` +
+              `This constraint was extracted from the schema with an invalid name. ` +
+              `The constraint name must be fixed in the schema definition or database.`
+            );
+          }
           statements.push(`ALTER TABLE "${tableName}" ADD CONSTRAINT "${unique.name}" UNIQUE (${uniqueColumns});`);
         } else {
           statements.push(`ALTER TABLE "${tableName}" ADD UNIQUE (${uniqueColumns});`);
@@ -680,11 +784,35 @@ export function generateMigrationFromSnapshotDiff(
     
     // Handle removed indexes
     for (const idx of tableDiff.removedIndexes) {
+      // Validate index name before using it
+      if (!/^[A-Za-z0-9_$]+$/.test(idx.name)) {
+        const invalidChars = idx.name.split('').filter(c => !/^[A-Za-z0-9_$]$/.test(c));
+        const uniqueInvalidChars = [...new Set(invalidChars)];
+        throw new Error(
+          `Invalid index name "${idx.name}" in table "${tableName}": ` +
+          `contains invalid characters: ${uniqueInvalidChars.map(c => `"${c}"`).join(', ')}. ` +
+          `Index names must only contain alphanumeric characters, underscores, and dollar signs. ` +
+          `This index was extracted from the schema with an invalid name. ` +
+          `The index name must be fixed in the schema definition or database.`
+        );
+      }
       statements.push(`DROP INDEX IF EXISTS "${idx.name}";`);
     }
     
     // Handle added indexes
     for (const idx of tableDiff.addedIndexes) {
+      // Validate index name before using it
+      if (!/^[A-Za-z0-9_$]+$/.test(idx.name)) {
+        const invalidChars = idx.name.split('').filter(c => !/^[A-Za-z0-9_$]$/.test(c));
+        const uniqueInvalidChars = [...new Set(invalidChars)];
+        throw new Error(
+          `Invalid index name "${idx.name}" in table "${tableName}": ` +
+          `contains invalid characters: ${uniqueInvalidChars.map(c => `"${c}"`).join(', ')}. ` +
+          `Index names must only contain alphanumeric characters, underscores, and dollar signs. ` +
+          `This index was extracted from the schema with an invalid name. ` +
+          `The index name must be fixed in the schema definition or database.`
+        );
+      }
       const indexColumns = idx.columns.map(name => `"${name}"`).join(', ');
       if (indexColumns) {
         const uniqueClause = idx.unique ? 'UNIQUE ' : '';
