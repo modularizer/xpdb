@@ -124,7 +124,9 @@ function parseColumnList(param: string): string[] {
 
 export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCallback }) {
     const { db: dbName_, table } = useLocalSearchParams<{ db: string; table: string }>();
-    const searchParams = useLocalSearchParams<{
+    const allParams = useLocalSearchParams<{
+        db?: string;
+        table?: string;
         page?: string;
         pageSize?: string;
         sortBy?: string;
@@ -134,12 +136,22 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         columnOrder?: string;
         columnWidths?: string;
         q?: string; // Query parameter for query mode
+        queryRows?: string; // Number of rows for query editor height
     }>();
+    
+    // Filter out db and table from searchParams for reading initial state (they're path params, not search params)
+    const initialSearchParams: Record<string, string> = {};
+    Object.entries(allParams).forEach(([key, value]) => {
+        if (key !== 'db' && key !== 'table' && value) {
+            initialSearchParams[key] = value;
+        }
+    });
 
     const dbName = dbName_ ? decodeURIComponent(dbName_) : null;
     // Treat empty string as query mode
     const initialTableName = table ? (table === '' ? '' : decodeURIComponent(table)) : '';
-    const initialQuery = searchParams.q ? decodeURIComponent(searchParams.q) : '';
+    const initialQuery = initialSearchParams.q ? decodeURIComponent(initialSearchParams.q) : '';
+    const initialQueryRows = initialSearchParams.queryRows ? parseInt(initialSearchParams.queryRows, 10) : 0;
 
     // Use local state for current table - NEVER sync from URL after initial mount
     // This prevents re-renders when we update the URL silently
@@ -170,21 +182,21 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
     const tableName = currentTableName;
 
     // Local state for all table controls (not driven by URL)
-    const [page, setPage] = useState(() => parseInt(searchParams.page || '1', 10));
-    const [pageSize, setPageSize] = useState(() => parseInt(searchParams.pageSize || '100', 10));
-    const [sortBy, setSortBy] = useState<string | null>(() => searchParams.sortBy || null);
-    const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(() => (searchParams.sortOrder as 'asc' | 'desc') || 'asc');
-    const [filterText, setFilterText] = useState(() => searchParams.filter || '');
+    const [page, setPage] = useState(() => parseInt(initialSearchParams.page || '1', 10));
+    const [pageSize, setPageSize] = useState(() => parseInt(initialSearchParams.pageSize || '100', 10));
+    const [sortBy, setSortBy] = useState<string | null>(() => initialSearchParams.sortBy || null);
+    const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(() => (initialSearchParams.sortOrder as 'asc' | 'desc') || 'asc');
+    const [filterText, setFilterText] = useState(() => initialSearchParams.filter || '');
     
     const [visibleColumns, setVisibleColumns] = useState<Set<string> | null>(() => {
-        const param = searchParams.visibleColumns || '';
+        const param = initialSearchParams.visibleColumns || '';
         if (param) {
             return new Set(parseColumnList(param));
         }
         return null; // null means all columns visible
     });
     const [columnOrder, setColumnOrder] = useState<string[] | undefined>(() => {
-        const param = searchParams.columnOrder || '';
+        const param = initialSearchParams.columnOrder || '';
         if (param) {
             return parseColumnList(param);
         }
@@ -193,7 +205,7 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
     
     // Parse column widths from URL (format: "col1:150,col2:200")
     const [columnWidths, setColumnWidths] = useState<Map<string, number>>(() => {
-        const param = searchParams.columnWidths || '';
+        const param = initialSearchParams.columnWidths || '';
         if (param) {
             const widths = new Map<string, number>();
             const pairs = param.split(',');
@@ -1432,18 +1444,9 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         return findSafeSeparator(columnNames);
     }, [queryResults?.columns]);
 
-    // Check if we're in paginated mode
-    const isPaginated = (queryResults?.totalRowCount || 0) > pageSize || page > 1;
-    
-    // Check if we have ALL the data (not paginated, all rows loaded)
-    // This means we can sort/filter in-place without re-running the query
-    const hasAllData = queryResults && 
-                       queryResults.rows.length === queryResults.totalRowCount && 
-                       page === 1 &&
-                       !isPaginated;
-
-    // Function to update URL via callback
-    const updateURLSilently = useCallback((updates: {
+    // Helper to build search params for NavigateCallback (excludes db and table which are path params)
+    // This is the ONLY place where search params are built - used exclusively for NavigateCallback
+    const buildSearchParams = useCallback((updates: {
         page?: number;
         pageSize?: number;
         sortBy?: string | null;
@@ -1452,7 +1455,11 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         visibleColumns?: Set<string> | null;
         columnOrder?: string[] | undefined;
         columnWidths?: Map<string, number>;
-    }) => {
+        q?: string;
+        queryRows?: number;
+    }): Record<string, string> => {
+        const searchParams: Record<string, string> = {};
+        
         const finalPage = updates.page !== undefined ? updates.page : page;
         const finalPageSize = updates.pageSize !== undefined ? updates.pageSize : pageSize;
         const finalSortBy = updates.sortBy !== undefined ? updates.sortBy : sortBy;
@@ -1461,8 +1468,8 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         const finalVisibleColumns = updates.visibleColumns !== undefined ? updates.visibleColumns : visibleColumns;
         const finalColumnOrder = updates.columnOrder !== undefined ? updates.columnOrder : columnOrder;
         const finalColumnWidths = updates.columnWidths !== undefined ? updates.columnWidths : columnWidths;
-        
-        const searchParams: Record<string, string> = {};
+        const finalQuery = updates.q !== undefined ? updates.q : queryText;
+        const finalQueryRows = updates.queryRows !== undefined ? updates.queryRows : (initialQueryRows);
         
         // Only add page if it's not the default (1)
         if (finalPage !== 1) searchParams.page = String(finalPage);
@@ -1486,7 +1493,6 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         // Only add columnOrder if it's different from the default (natural order of all columns)
         if (finalColumnOrder && queryResults) {
             const allColumns = queryResults.columns.map(c => c.name);
-            // Check if column order is different from natural order
             const isDifferentOrder = finalColumnOrder.length !== allColumns.length ||
                 finalColumnOrder.some((col, idx) => col !== allColumns[idx]);
             if (isDifferentOrder) {
@@ -1504,22 +1510,54 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         }
         
         // Add query text to params if it's anything other than the default auto-generated query
-        if (queryText) {
+        if (finalQuery) {
             if (tableName === '') {
                 // Query mode - always include query
-                searchParams.q = queryText;
+                searchParams.q = finalQuery;
             } else {
                 // Table mode - only include if query doesn't match the default pattern
-                const defaultQuery = generateDefaultQuery(tableName, page, pageSize, sortBy, sortOrder, filterText);
-                if (queryText.trim() !== defaultQuery.trim()) {
-                    searchParams.q = queryText;
+                const defaultQuery = generateDefaultQuery(tableName, finalPage, finalPageSize, finalSortBy, finalSortOrder, finalFilter);
+                if (finalQuery.trim() !== defaultQuery.trim()) {
+                    searchParams.q = finalQuery;
                 }
             }
         }
         
-        // Call onNavigate with the search params
+        // Add queryRows if non-zero
+        if (finalQueryRows > 0) {
+            searchParams.queryRows = String(finalQueryRows);
+        }
+        
+        return searchParams;
+    }, [page, pageSize, sortBy, sortOrder, filterText, visibleColumns, columnOrder, columnWidths, queryText, initialQueryRows, queryResults, columnSeparator, tableName, generateDefaultQuery]);
+
+    // Check if we're in paginated mode
+    const isPaginated = (queryResults?.totalRowCount || 0) > pageSize || page > 1;
+    
+    // Check if we have ALL the data (not paginated, all rows loaded)
+    // This means we can sort/filter in-place without re-running the query
+    const hasAllData = queryResults && 
+                       queryResults.rows.length === queryResults.totalRowCount && 
+                       page === 1 &&
+                       !isPaginated;
+
+    // Function to update URL via NavigateCallback - uses buildSearchParams helper (ONLY way to build search params)
+    const updateURLSilently = useCallback((updates: {
+        page?: number;
+        pageSize?: number;
+        sortBy?: string | null;
+        sortOrder?: 'asc' | 'desc';
+        filter?: string;
+        visibleColumns?: Set<string> | null;
+        columnOrder?: string[] | undefined;
+        columnWidths?: Map<string, number>;
+        q?: string;
+        queryRows?: number;
+    }) => {
+        const searchParams = buildSearchParams(updates);
+        // Call onNavigate with the search params - this is the ONLY way to update the URL
         onNavigate(dbName, tableName || null, searchParams);
-    }, [page, pageSize, sortBy, sortOrder, filterText, visibleColumns, columnOrder, columnWidths, dbName, tableName, queryResults, columnSeparator, queryText, generateDefaultQuery, onNavigate]);
+    }, [dbName, tableName, buildSearchParams, onNavigate]);
 
 
 
@@ -1774,6 +1812,14 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
                         loading={queryLoading}
                         showExpandButton={sidebarCollapsed}
                         onExpand={toggleSidebar}
+                        initialRows={initialQueryRows}
+                        onHeightChange={(rows) => {
+                            // Update URL with queryRows - use buildSearchParams helper (only way to build search params)
+                            const searchParams = buildSearchParams({
+                                queryRows: rows,
+                            });
+                            onNavigate(dbName, currentTableName || '', searchParams);
+                        }}
                     />
                 )}
             </SidebarContext.Consumer>

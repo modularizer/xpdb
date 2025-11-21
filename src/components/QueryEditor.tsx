@@ -30,6 +30,8 @@ export interface QueryEditorProps {
     onExpand?: () => void;
     showCollapseButton?: boolean;
     onCollapse?: () => void;
+    initialRows?: number; // Initial number of rows from URL
+    onHeightChange?: (rows: number) => void; // Callback when height changes (rows)
 }
 
 export default function QueryEditor({
@@ -43,15 +45,16 @@ export default function QueryEditor({
     onExpand,
     showCollapseButton = false,
     onCollapse,
+    initialRows = 0,
+    onHeightChange,
 }: QueryEditorProps) {
     // Default height matches sidebar header (65px), can expand in row increments
     const HEADER_HEIGHT = 64; // Matches sidebar databaseDropdownRow minHeight
-    const ROW_HEIGHT = 35; // Approximate row height for snapping
-    const startRows = 0;
-    const [containerHeight, setContainerHeight] = useState(HEADER_HEIGHT + startRows * ROW_HEIGHT); // Default to header + 1 row to prove it works
+    const ROW_HEIGHT = 36; // Approximate row height for snapping
+    const [containerHeight, setContainerHeight] = useState(HEADER_HEIGHT + initialRows * ROW_HEIGHT);
     const [isResizing, setIsResizing] = useState(false);
     const resizeStartYRef = useRef(0);
-    const resizeStartHeightRef = useRef(HEADER_HEIGHT + startRows * ROW_HEIGHT);
+    const resizeStartHeightRef = useRef(HEADER_HEIGHT + initialRows * ROW_HEIGHT);
     const inputRef = useRef<TextInput>(null);
     const domElementRef = useRef<HTMLTextAreaElement | HTMLInputElement | null>(null);
     const resizeHandleRef = useRef<View | null>(null);
@@ -165,6 +168,11 @@ export default function QueryEditor({
             );
             console.log('[QueryEditor] Mouse move - Y:', clientY, 'startY:', resizeStartYRef.current, 'diff:', diff, 'rawHeight:', rawHeight, 'rows:', rows, 'snappedHeight:', snappedHeight, 'new height:', newHeight);
             setContainerHeight(newHeight);
+            
+            // Update URL if rows changed and callback is provided
+            if (onHeightChange && rows >= 0) {
+                onHeightChange(rows);
+            }
         };
 
         const handleMouseUp = () => {

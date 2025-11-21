@@ -1167,7 +1167,25 @@ export default function TableViewer({
                             handleCellClick(value, col.name);
                           }
                         }}
+                        onLongPress={async () => {
+                          // Long press handler - same as regular click for FK cells
+                          const fk = foreignKeys.find(fk => fk.columns.includes(col.name));
+                          if (fk && !isNull) {
+                            // Show modal with foreign record (on long press)
+                            await showFKRecordModalForCell(col.name, value, fk);
+                          }
+                        }}
                         {...(Platform.OS === 'web' ? {
+                          onContextMenu: async (e: any) => {
+                            // Right-click handler - same as regular click for FK cells
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const fk = foreignKeys.find(fk => fk.columns.includes(col.name));
+                            if (fk && !isNull) {
+                              // Show modal with foreign record (on right-click)
+                              await showFKRecordModalForCell(col.name, value, fk);
+                            }
+                          },
                           onMouseEnter: async (e: any) => {
                             // Check if this is an FK column
                             const fk = foreignKeys.find(fk => fk.columns.includes(col.name));
