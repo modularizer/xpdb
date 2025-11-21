@@ -25,6 +25,7 @@ import {extractRuntimeSchemaMetadata} from "../xp-sql/utils/schema-extraction/ex
 import {compareTables, type SchemaDiff} from "../xp-sql/utils/schema-extraction/schema-diff";
 import {generateMigrationFromSnapshotDiff, type SchemaSnapshot} from "../xp-sql/utils/sql-generation/snapshot-sql-generator";
 import {bindTable, isUTable, type UTable} from "../xp-sql/dialects/implementations/unbound";
+import {createOrRetrieveRegistryEntry} from "../registry-storage";
 
 
 
@@ -94,6 +95,17 @@ export async function connect<TTables extends Record<string, Table | any> = Reco
     const driver = await connectToDriver(connInfo);
     const dialectName = driver.dialectName;
     const dialect = await getDialectFromName(dialectName);
+    
+    // Ensure connection info includes dialectName and driverName from the driver
+    const fullConnInfo: DbConnectionInfo = {
+        ...connInfo,
+        dialectName: driver.dialectName,
+        driverName: driver.driverName,
+    };
+    
+    // Automatically save connection info to registry
+    await createOrRetrieveRegistryEntry(fullConnInfo);
+    
     return new XPDatabaseConnectionPlus(driver, dialect, schema) as XPDatabaseConnectionPlusWithTables<TTables>;
 }
 

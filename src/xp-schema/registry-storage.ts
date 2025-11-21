@@ -16,8 +16,19 @@ const registryKey = 'databases';
  */
 export async function getRegistryEntries({driverName, dialectName, name}: {driverName?: string, dialectName?: string, name?: string} = {}): Promise<DbConnectionInfo[]> {
   const storage = await getStorage();
-  const entries = (await storage.get<DbConnectionInfo[]>(registryKey)) ?? [];
-  return entries.filter((d) => (d.driverName === (driverName ?? d.driverName)) && (dialectName === (dialectName ?? d.dialectName)) && (d.name === (name ?? d.name)))
+  const rawValue = await storage.get<DbConnectionInfo[]>(registryKey);
+  console.log('[registry-storage] Raw value from storage:', rawValue);
+  const entries = rawValue ?? [];
+  console.log('[registry-storage] Entries after nullish coalescing:', entries);
+  console.log('[registry-storage] Entries length:', entries.length);
+  const filtered = entries.filter((d) => {
+    if (driverName !== undefined && d.driverName !== driverName) return false;
+    if (dialectName !== undefined && d.dialectName !== dialectName) return false;
+    if (name !== undefined && d.name !== name) return false;
+    return true;
+  });
+  console.log('[registry-storage] Filtered entries:', filtered);
+  return filtered;
 }
 
 export async function getRegistryEntry(name: string) {

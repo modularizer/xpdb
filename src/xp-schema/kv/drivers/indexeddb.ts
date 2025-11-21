@@ -59,7 +59,7 @@ export class IndexedDBStorage implements KeyValueStorage {
         
         request.onsuccess = () => {
           const result = request.result;
-          if (result === undefined) {
+          if (result === undefined || result === null) {
             resolve(undefined);
           } else {
             // IndexedDB stores values as-is, so we can return directly
