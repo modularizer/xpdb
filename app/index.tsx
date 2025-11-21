@@ -10,6 +10,7 @@ import TestPage, { type Test } from '../src/pages/TestPage';
 import { runCRUDTest } from '../src/tests/crud-test';
 import { runSportsDBTest } from '../src/tests/sports-db-test';
 import { runDebugInsertTest } from '../src/tests/debug-insert-test';
+import { runPresidentsDBTest } from '../src/tests/presidents-db-test';
 
 // Define available tests
 const tests: Test[] = [
@@ -32,6 +33,16 @@ const tests: Test[] = [
       dialectName: 'pg',
     },
     run: (addLog) => runSportsDBTest(addLog, 'sports-db'),
+  },
+  {
+    name: 'Presidents DB',
+    description: 'Sets up and seeds a database about US presidents, states, elections, and presidency statistics',
+    connectionInfo: {
+      name: 'presidents-db',
+      driverName: 'pglite',
+      dialectName: 'pg',
+    },
+    run: (addLog) => runPresidentsDBTest(addLog, 'presidents-db'),
   },
   {
     name: 'Debug Insert Test',

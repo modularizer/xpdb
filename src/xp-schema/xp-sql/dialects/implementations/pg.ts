@@ -301,12 +301,34 @@ async function getTableColumns(db: DrizzleDatabaseConnectionDriver, tableName: s
         ORDER BY ordinal_position
       `);
 
-    const info = result.rows.map((row: any) => ({
-        name: row.name,
-        dataType: row.dataType || row.data_type || 'unknown',
-        isNullable: row.isNullable !== undefined ? row.isNullable : row.is_nullable === 'YES',
-        columnDefault: row.columnDefault || row.column_default || null,
-    }));
+    const info = result.rows.map((row: any) => {
+        // Handle case-insensitive column name access - check all possible variations
+        // PostgreSQL may return column names in different cases depending on quoting
+        // Try all possible key variations
+        let columnDefault: string | null = null;
+        if (row.columnDefault !== undefined && row.columnDefault !== null) {
+            columnDefault = row.columnDefault;
+        } else if (row.column_default !== undefined && row.column_default !== null) {
+            columnDefault = row.column_default;
+        } else if (row.columndefault !== undefined && row.columndefault !== null) {
+            columnDefault = row.columndefault;
+        } else {
+            // Check all keys in the row object
+            for (const key of Object.keys(row)) {
+                if (key.toLowerCase() === 'columndefault' || key.toLowerCase() === 'column_default') {
+                    columnDefault = row[key];
+                    break;
+                }
+            }
+        }
+        
+        return {
+            name: row.name,
+            dataType: row.dataType || row.data_type || 'unknown',
+            isNullable: row.isNullable !== undefined ? row.isNullable : row.is_nullable === 'YES',
+            columnDefault: columnDefault,
+        };
+    });
     return info.map((row: ColumnInfo) => ({
         ...row,
         drizzleColumn: pgTypeToDrizzleColumn(row)

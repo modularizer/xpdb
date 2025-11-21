@@ -13,9 +13,11 @@ import {
 import { useLocalSearchParams } from 'expo-router';
 import { connect, getRegistryEntries } from '../xp-schema';
 import { sql } from 'drizzle-orm';
-import TableViewer, { TableViewerColumn, TableViewerRow } from '../components/TableViewer';
+import TableViewer, { TableViewerColumn, TableViewerRow, ForeignKeyInfo, FKLookupConfig } from '../components/TableViewer';
 import QueryEditor from '../components/QueryEditor';
 import DatabaseBrowserLayout, { SidebarContext, NavigateCallback } from '../components/DatabaseBrowserLayout';
+import { determineLookupColumn, getFKForColumn, getReferencedColumn } from '../utils/fk-utils';
+import type { ForeignKeyInfo as SchemaForeignKeyInfo } from '../xp-schema/xp-sql/dialects/types';
 
 /**
  * Parse SQL query to extract table name and detect if it's a complex query
@@ -212,6 +214,103 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
     // Driver connection and query state
     const [db, setDb] = useState<any>(null);
     const [tables, setTables] = useState<string[]>([]); // List of valid table names
+    
+    // Database operation queue to serialize all DB operations and prevent WASM conflicts
+    const dbOperationQueueRef = useRef<Promise<any>>(Promise.resolve());
+    const dbReadyRef = useRef(false);
+    
+    // Ensure database is ready before operations
+    const ensureDbReady = useCallback(async () => {
+        if (dbReadyRef.current) return;
+        
+        if (!db) {
+            throw new Error('Database not connected');
+        }
+        
+        // For PGLite, ensure it's fully initialized
+        // Check if the database has a waitReady method or similar
+        if (db.db) {
+            // Check if it's PGLite
+            const isPGLite = db.db.constructor?.name === 'PGlite' || 
+                            db.db.constructor?.name === 'PGliteDatabase' ||
+                            (db.db as any).waitReady !== undefined;
+            
+            if (isPGLite) {
+                // Wait for PGLite to be ready
+                if (typeof (db.db as any).waitReady === 'function') {
+                    try {
+                        await (db.db as any).waitReady;
+                    } catch (err) {
+                        console.warn('[DB Ready] Error waiting for PGLite waitReady:', err);
+                    }
+                }
+                
+                // Additional wait to ensure WASM is fully compiled
+                await new Promise(resolve => setTimeout(resolve, 150));
+            }
+        }
+        
+        // Try a simple operation to ensure WASM is ready
+        // Use a retry mechanism with exponential backoff
+        let retryCount = 0;
+        const maxRetries = 5;
+        
+        while (retryCount < maxRetries) {
+            try {
+                await db.execute(sql.raw('SELECT 1'));
+                dbReadyRef.current = true;
+                return; // Success
+            } catch (err: any) {
+                retryCount++;
+                // If it's a WASM error, wait longer and retry
+                if (err?.message?.includes('WebAssembly') || err?.message?.includes('already read')) {
+                    if (retryCount < maxRetries) {
+                        const delay = Math.min(200 * Math.pow(2, retryCount - 1), 2000); // Exponential backoff, max 2s
+                        console.warn(`[DB Ready] WASM error (attempt ${retryCount}/${maxRetries}), waiting ${delay}ms...`);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    } else {
+                        console.error('[DB Ready] Failed to initialize database after retries:', err);
+                        throw err;
+                    }
+                } else {
+                    // Non-WASM error, throw immediately
+                    throw err;
+                }
+            }
+        }
+    }, [db]);
+    
+    // Queue a database operation to prevent concurrent WASM access
+    const queueDbOperation = useCallback(async <T,>(operation: () => Promise<T>): Promise<T> => {
+        // Ensure DB is ready first
+        await ensureDbReady();
+        
+        // Wait for previous operation to complete
+        await dbOperationQueueRef.current;
+        
+        // Add a small delay between operations to be safe
+        await new Promise(resolve => setTimeout(resolve, 20));
+        
+        // Create a new promise for this operation
+        let resolveOperation: (value: T) => void;
+        let rejectOperation: (error: any) => void;
+        const operationPromise = new Promise<T>((resolve, reject) => {
+            resolveOperation = resolve;
+            rejectOperation = reject;
+        });
+        
+        // Update the queue
+        dbOperationQueueRef.current = operationPromise.catch(() => {}).then(() => {});
+        
+        try {
+            const result = await operation();
+            resolveOperation!(result);
+            return result;
+        } catch (error) {
+            rejectOperation!(error);
+            throw error;
+        }
+    }, [ensureDbReady]);
     // Initialize queryText from URL param if provided (query mode or non-default query), otherwise empty
     const [queryText, setQueryText] = useState<string>(initialQuery || '');
     
@@ -233,15 +332,156 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         rows: TableViewerRow[];
         totalRowCount: number;
     } | null>(null);
+    
+    // Foreign key metadata
+    const [foreignKeys, setForeignKeys] = useState<ForeignKeyInfo[]>([]);
+    const [fkLookupConfig, setFKLookupConfig] = useState<FKLookupConfig>({});
+    const [fkLookupData, setFKLookupData] = useState<Map<string, Map<string | number, any>>>(new Map());
 
-    // Generate default query based on table name and pagination
-    const generateDefaultQuery = useCallback((table: string | null, currentPage: number, currentPageSize: number): string => {
+    // Generate default query based on table name, pagination, sorting, and filtering
+    const generateDefaultQuery = useCallback((
+        table: string | null, 
+        currentPage: number, 
+        currentPageSize: number,
+        currentSortBy?: string | null,
+        currentSortOrder?: 'asc' | 'desc',
+        currentFilterText?: string
+    ): string => {
         if (!table) return '';
         const offset = (currentPage - 1) * currentPageSize;
         // Ensure table name is properly escaped and doesn't contain brackets
         const safeTableName = String(table).replace(/[\[\]]/g, '');
-        return `SELECT * FROM "${safeTableName}" LIMIT ${currentPageSize} OFFSET ${offset}`;
-    }, []);
+        
+        // Check if we need JOINs for FK lookups (for sorting/filtering)
+        const needsJoinForSort = currentSortBy && fkLookupConfig[currentSortBy];
+        const needsJoinForFilter = currentFilterText && Object.keys(fkLookupConfig).some(fkCol => {
+            // Check if filter text might match this FK column (simple heuristic)
+            return currentFilterText && currentFilterText.trim().length > 0;
+        });
+        
+        // Find all FK columns that need JOINs (for sorting or filtering)
+        const fkColumnsNeedingJoin = new Set<string>();
+        if (needsJoinForSort && currentSortBy) {
+            fkColumnsNeedingJoin.add(currentSortBy);
+        }
+        // For filtering, we need to check all FK columns - we'll add JOINs for all configured FKs
+        // and filter on the lookup columns
+        if (currentFilterText && currentFilterText.trim()) {
+            Object.keys(fkLookupConfig).forEach(fkCol => {
+                fkColumnsNeedingJoin.add(fkCol);
+            });
+        }
+        
+        // Build JOINs and SELECT columns
+        const joins: string[] = [];
+        const selectColumns: string[] = [`"${safeTableName}".*`];
+        let joinAliasCounter = 1;
+        const joinAliases = new Map<string, string>(); // Map FK column -> table alias
+        
+        // Add JOINs for each FK column that needs it
+        for (const fkColumn of fkColumnsNeedingJoin) {
+            const fkConfig = fkLookupConfig[fkColumn];
+            if (!fkConfig) continue;
+            
+            const refTable = fkConfig.fk.referencedTable;
+            const fkColIndex = fkConfig.fk.columns.indexOf(fkColumn);
+            const refColumn = fkConfig.fk.referencedColumns[fkColIndex];
+            const lookupCol = fkConfig.lookupColumn;
+            const alias = `t${joinAliasCounter++}`;
+            joinAliases.set(fkColumn, alias);
+            
+            // Add JOIN
+            joins.push(`LEFT JOIN "${refTable}" ${alias} ON ${alias}."${refColumn}" = "${safeTableName}"."${fkColumn}"`);
+            
+            // Add nested FK JOIN if needed
+            if (fkConfig.nestedFK) {
+                const nestedFK = fkConfig.nestedFK;
+                const nestedRefTable = nestedFK.fk.referencedTable;
+                const nestedFKCol = nestedFK.fk.columns[0];
+                const nestedRefCol = nestedFK.fk.referencedColumns[0];
+                const nestedLookupCol = nestedFK.lookupColumn;
+                const nestedAlias = `t${joinAliasCounter++}`;
+                
+                joins.push(`LEFT JOIN "${nestedRefTable}" ${nestedAlias} ON ${nestedAlias}."${nestedRefCol}" = ${alias}."${nestedFKCol}"`);
+                joinAliases.set(`${fkColumn}_nested`, nestedAlias);
+            }
+        }
+        
+        // Build WHERE clause for filtering
+        let whereClause = '';
+        if (currentFilterText && currentFilterText.trim()) {
+            const filterText = currentFilterText.trim();
+            const escapedFilter = filterText.replace(/'/g, "''");
+            const conditions: string[] = [];
+            
+            // Get all columns from the table (we'll need to query for this, but for now use a simple approach)
+            // For FK columns with lookup config, filter on the lookup column
+            for (const fkColumn of Object.keys(fkLookupConfig)) {
+                const fkConfig = fkLookupConfig[fkColumn];
+                const alias = joinAliases.get(fkColumn);
+                if (alias) {
+                    // Use nested lookup column if available, otherwise use intermediate lookup column
+                    if (fkConfig.nestedFK) {
+                        const nestedAlias = joinAliases.get(`${fkColumn}_nested`);
+                        if (nestedAlias) {
+                            conditions.push(`${nestedAlias}."${fkConfig.nestedFK.lookupColumn}" ILIKE '%${escapedFilter}%'`);
+                        } else {
+                            conditions.push(`${alias}."${fkConfig.lookupColumn}" ILIKE '%${escapedFilter}%'`);
+                        }
+                    } else {
+                        conditions.push(`${alias}."${fkConfig.lookupColumn}" ILIKE '%${escapedFilter}%'`);
+                    }
+                }
+            }
+            
+            // Note: We only filter on FK lookup columns when FK lookup is configured.
+            // For regular columns, filtering would require knowing all column names,
+            // which we don't have in this context. The filter will work on FK lookup
+            // columns (showing the looked-up values) as requested.
+            
+            if (conditions.length > 0) {
+                whereClause = `WHERE ${conditions.join(' OR ')}`;
+            }
+            // If no FK conditions but filter text exists, we don't add a WHERE clause
+            // because we don't know which columns to filter on. The filter will be
+            // applied client-side by the TableViewer component for non-FK columns.
+        }
+        
+        // Build ORDER BY clause
+        let orderByClause = '';
+        if (currentSortBy) {
+            const fkConfig = fkLookupConfig[currentSortBy];
+            if (fkConfig) {
+                // Sort by lookup column
+                const alias = joinAliases.get(currentSortBy);
+                if (alias) {
+                    // Use nested lookup column if available
+                    if (fkConfig.nestedFK) {
+                        const nestedAlias = joinAliases.get(`${currentSortBy}_nested`);
+                        if (nestedAlias) {
+                            orderByClause = `ORDER BY ${nestedAlias}."${fkConfig.nestedFK.lookupColumn}" ${currentSortOrder || 'asc'}`;
+                        } else {
+                            orderByClause = `ORDER BY ${alias}."${fkConfig.lookupColumn}" ${currentSortOrder || 'asc'}`;
+                        }
+                    } else {
+                        orderByClause = `ORDER BY ${alias}."${fkConfig.lookupColumn}" ${currentSortOrder || 'asc'}`;
+                    }
+                } else {
+                    // Fallback to FK column if JOIN wasn't added
+                    orderByClause = `ORDER BY "${safeTableName}"."${currentSortBy}" ${currentSortOrder || 'asc'}`;
+                }
+            } else {
+                // Regular column sorting
+                orderByClause = `ORDER BY "${safeTableName}"."${currentSortBy}" ${currentSortOrder || 'asc'}`;
+            }
+        }
+        
+        // Build the final query
+        const joinClause = joins.length > 0 ? ' ' + joins.join(' ') : '';
+        const query = `SELECT ${selectColumns.join(', ')} FROM "${safeTableName}"${joinClause} ${whereClause} ${orderByClause} LIMIT ${currentPageSize} OFFSET ${offset}`.trim();
+        
+        return query;
+    }, [fkLookupConfig]);
 
     // Track if query was manually edited (not auto-generated)
     const [isQueryManuallyEdited, setIsQueryManuallyEdited] = useState(false);
@@ -268,13 +508,13 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [db, tableName, initialQuery]);
 
-    // Update query text when table, page, or pageSize changes
+    // Update query text when table, page, pageSize, sortBy, sortOrder, or filterText changes
     const lastGeneratedQueryRef = useRef<string>('');
     const lastTableRef = useRef<string | null>(null);
     useEffect(() => {
         // Don't auto-generate queries when tableName is empty string (query mode)
         if (tableName && tableName !== '') {
-            const newQuery = generateDefaultQuery(tableName, page, pageSize);
+            const newQuery = generateDefaultQuery(tableName, page, pageSize, sortBy, sortOrder, filterText);
             const tableChanged = tableName !== lastTableRef.current;
             // Only update if query actually changed to avoid unnecessary re-renders
             if (newQuery !== lastGeneratedQueryRef.current) {
@@ -306,7 +546,7 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
             }
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [tableName, page, pageSize, generateDefaultQuery, db]);
+    }, [tableName, page, pageSize, sortBy, sortOrder, filterText, generateDefaultQuery, db]);
 
     // Detect manual query edits and parse query to determine mode
     // Use a ref to track if this is the initial mount to avoid false positives
@@ -330,7 +570,7 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
             return;
         }
         
-        const expectedQuery = generateDefaultQuery(tableName || '', page, pageSize);
+        const expectedQuery = generateDefaultQuery(tableName || '', page, pageSize, sortBy, sortOrder, filterText);
         
         // If query doesn't match the auto-generated one, parse it
         // This includes empty queries (which don't match any expected query)
@@ -408,6 +648,339 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         }
     }, [queryText, tableName, page, pageSize, generateDefaultQuery, dbName, setCurrentTableName, tables]);
 
+    // Load FK metadata for a table
+    const loadFKMetadata = useCallback(async (tableName: string | null) => {
+        if (!db || !tableName || tableName === '') {
+            setForeignKeys([]);
+            setFKLookupConfig({});
+            return;
+        }
+
+        try {
+            // Queue the operation to prevent concurrent WASM access
+            const schemaFKs: SchemaForeignKeyInfo[] = await queueDbOperation(async () => {
+                // Add initial delay to ensure database is ready
+                await new Promise(resolve => setTimeout(resolve, 50));
+                
+                // Get FK metadata from the database
+                // Add error handling for WASM issues
+                let result: SchemaForeignKeyInfo[] = [];
+                let retryCount = 0;
+                const maxRetries = 3;
+                
+                while (retryCount < maxRetries) {
+                    try {
+                        result = await db.dialect.getTableForeignKeys(db.db, tableName, 'public');
+                        break; // Success, exit retry loop
+                    } catch (err: any) {
+                        retryCount++;
+                        // If it's a WASM error, wait longer and retry
+                        if (err?.message?.includes('WebAssembly') || err?.message?.includes('already read')) {
+                            if (retryCount < maxRetries) {
+                                console.warn(`[FK] WASM error detected (attempt ${retryCount}/${maxRetries}), retrying after delay...`);
+                                await new Promise(resolve => setTimeout(resolve, 200 * retryCount)); // Exponential backoff
+                            } else {
+                                console.error('[FK] Failed to load FK metadata after retries:', err);
+                                throw err;
+                            }
+                        } else {
+                            throw err;
+                        }
+                    }
+                }
+                
+                return result;
+            });
+            
+            // Convert to TableViewer format
+            const fks: ForeignKeyInfo[] = schemaFKs.map(fk => ({
+                columns: fk.columns,
+                referencedTable: fk.referencedTable,
+                referencedColumns: fk.referencedColumns,
+            }));
+            
+            setForeignKeys(fks);
+            
+            // Determine lookup columns for each FK sequentially to avoid WASM issues
+            const config: FKLookupConfig = {};
+            
+            // Helper function to check if a column in a table is an FK
+            const checkIfColumnIsFK = async (tableName: string, columnName: string): Promise<SchemaForeignKeyInfo | null> => {
+                try {
+                    const tableFKs = await queueDbOperation(async () => {
+                        return await db.dialect.getTableForeignKeys(db.db, tableName, 'public');
+                    });
+                    return tableFKs.find(fk => fk.columns.includes(columnName)) || null;
+                } catch (err) {
+                    return null;
+                }
+            };
+            
+            for (const fk of fks) {
+                // For each column in the FK, determine the lookup column
+                for (const localCol of fk.columns) {
+                        try {
+                            // Queue column fetch operation
+                            const refTableColumns = await queueDbOperation(async () => {
+                                // Add small delay between column fetches to avoid WASM issues
+                                await new Promise(resolve => setTimeout(resolve, 10));
+                                
+                                // Get columns of the referenced table
+                                let result;
+                                try {
+                                    result = await db.dialect.getTableColumns(db.db, fk.referencedTable, 'public');
+                                } catch (err: any) {
+                                    // Retry on WASM errors
+                                    if (err?.message?.includes('WebAssembly') || err?.message?.includes('already read')) {
+                                        await new Promise(resolve => setTimeout(resolve, 100));
+                                        result = await db.dialect.getTableColumns(db.db, fk.referencedTable, 'public');
+                                    } else {
+                                        throw err;
+                                    }
+                                }
+                                return result;
+                            });
+                        
+                        const refColumnNames = refTableColumns.map(c => c.name);
+                        
+                        // Determine the best lookup column
+                        const lookupColumn = determineLookupColumn(refColumnNames);
+                        
+                        if (lookupColumn) {
+                            // Check if the lookup column is itself a foreign key
+                            const nestedFK = await checkIfColumnIsFK(fk.referencedTable, lookupColumn);
+                            
+                            let nestedConfig: FKLookupConfig[string]['nestedFK'] | undefined = undefined;
+                            
+                            if (nestedFK) {
+                                // The lookup column is itself an FK - get its referenced table columns
+                                    try {
+                                        const nestedRefTableColumns = await queueDbOperation(async () => {
+                                            await new Promise(resolve => setTimeout(resolve, 10));
+                                            return await db.dialect.getTableColumns(db.db, nestedFK.referencedTable, 'public');
+                                        });
+                                        const nestedRefColumnNames = nestedRefTableColumns.map(c => c.name);
+                                        const nestedLookupColumn = determineLookupColumn(nestedRefColumnNames);
+                                        
+                                        if (nestedLookupColumn) {
+                                            nestedConfig = {
+                                                fk: {
+                                                    columns: nestedFK.columns,
+                                                    referencedTable: nestedFK.referencedTable,
+                                                    referencedColumns: nestedFK.referencedColumns,
+                                                },
+                                                lookupColumn: nestedLookupColumn,
+                                            };
+                                        }
+                                    } catch (err) {
+                                        console.error(`[FK] Error determining nested FK lookup for ${lookupColumn}:`, err);
+                                        // Continue without nested FK config
+                                    }
+                            }
+                            
+                            config[localCol] = {
+                                fk,
+                                lookupColumn,
+                                ...(nestedConfig && { nestedFK: nestedConfig }),
+                            };
+                        }
+                    } catch (err) {
+                        console.error(`[FK] Error determining lookup column for ${localCol}:`, err);
+                        // Continue with other columns even if one fails
+                    }
+                }
+            }
+            
+            setFKLookupConfig(config);
+        } catch (err) {
+            console.error('[FK] Error loading FK metadata:', err);
+            setForeignKeys([]);
+            setFKLookupConfig({});
+        }
+    }, [db, queueDbOperation]);
+
+    // Load FK lookup data for visible rows
+    const loadFKLookupData = useCallback(async (rows: TableViewerRow[], config: FKLookupConfig) => {
+        if (!db || Object.keys(config).length === 0 || rows.length === 0) {
+            return;
+        }
+
+        try {
+            // Add initial delay to avoid concurrent WASM operations
+            await new Promise(resolve => setTimeout(resolve, 50));
+            const lookupData = new Map<string, Map<string | number, any>>();
+            
+            // Collect all unique FK values for each FK column
+            const fkValueMap = new Map<string, Set<string | number>>();
+            for (const [fkColumn, fkConfig] of Object.entries(config)) {
+                const fkValues = new Set<string | number>();
+                for (const row of rows) {
+                    const fkValue = row[fkColumn];
+                    if (fkValue !== null && fkValue !== undefined) {
+                        fkValues.add(fkValue);
+                    }
+                }
+                if (fkValues.size > 0) {
+                    fkValueMap.set(fkColumn, fkValues);
+                }
+            }
+            
+            if (fkValueMap.size === 0) {
+                return;
+            }
+            
+            // Build a single query with JOINs for all FK lookups
+            // Structure: VALUES clause with all FK values, then LEFT JOIN each referenced table
+            // For nested FKs, add additional JOINs
+            
+            // Step 1: Build VALUES clause with all FK values
+            const fkColumns = Array.from(fkValueMap.keys());
+            const fkValuesArray = Array.from(fkValueMap.values());
+            const maxValues = Math.max(...fkValuesArray.map(s => s.size));
+            
+            if (maxValues === 0) return;
+            
+            // Build VALUES rows - each row contains all FK values for that combination
+            // We need to create a cartesian product of all FK values, but that's inefficient
+            // Instead, we'll create separate queries for each FK column, but use JOINs for nested lookups
+            
+            // For now, let's process each FK column separately but use JOINs for nested FKs
+            for (const [fkColumn, fkConfig] of Object.entries(config)) {
+                const fkValues = fkValueMap.get(fkColumn);
+                if (!fkValues || fkValues.size === 0) continue;
+                
+                try {
+                    const refTable = fkConfig.fk.referencedTable;
+                    const lookupCol = fkConfig.lookupColumn;
+                    
+                    // Get the referenced column name
+                    const fkColIndex = fkConfig.fk.columns.indexOf(fkColumn);
+                    const refColumn = fkConfig.fk.referencedColumns[fkColIndex];
+                    
+                    const fkValuesArray = Array.from(fkValues);
+                    
+                    // Check if we need nested FK lookup
+                    const needsNestedLookup = fkConfig.nestedFK;
+                    
+                    // Build query with JOINs
+                    let queryStr: string;
+                    
+                    if (needsNestedLookup) {
+                        // Build query with nested JOIN
+                        const nestedFK = fkConfig.nestedFK!;
+                        const nestedRefTable = nestedFK.fk.referencedTable;
+                        const nestedLookupCol = nestedFK.lookupColumn;
+                        
+                        // Find the FK column in the intermediate table that references the nested table
+                        const nestedFKCol = nestedFK.fk.columns[0]; // For one-to-one, use first column
+                        const nestedRefCol = nestedFK.fk.referencedColumns[0];
+                        
+                        // Build VALUES clause for FK values
+                        const valuesClause = fkValuesArray.map(v => {
+                            if (typeof v === 'string') {
+                                return `('${v.replace(/'/g, "''")}')`;
+                            } else if (v === null || v === undefined) {
+                                return '(NULL)';
+                            } else {
+                                return `(${String(v)})`;
+                            }
+                        }).join(', ');
+                        
+                        // Build query with JOINs: VALUES -> intermediate table -> nested table
+                        queryStr = `
+                            WITH fk_vals AS (
+                                SELECT DISTINCT val AS fk_val FROM (VALUES ${valuesClause}) AS t(val)
+                            )
+                            SELECT 
+                                fv.fk_val,
+                                t1."${lookupCol}" AS lookup_val,
+                                t2."${nestedLookupCol}" AS nested_lookup_val
+                            FROM fk_vals fv
+                            LEFT JOIN "${refTable}" t1 ON t1."${refColumn}" = fv.fk_val
+                            LEFT JOIN "${nestedRefTable}" t2 ON t2."${nestedRefCol}" = t1."${nestedFKCol}"
+                        `.trim();
+                    } else {
+                        // Simple FK lookup with JOIN
+                        const valuesClause = fkValuesArray.map(v => {
+                            if (typeof v === 'string') {
+                                return `('${v.replace(/'/g, "''")}')`;
+                            } else if (v === null || v === undefined) {
+                                return '(NULL)';
+                            } else {
+                                return `(${String(v)})`;
+                            }
+                        }).join(', ');
+                        
+                        queryStr = `
+                            WITH fk_vals AS (
+                                SELECT DISTINCT val AS fk_val FROM (VALUES ${valuesClause}) AS t(val)
+                            )
+                            SELECT 
+                                fv.fk_val,
+                                t1."${lookupCol}" AS lookup_val
+                            FROM fk_vals fv
+                            LEFT JOIN "${refTable}" t1 ON t1."${refColumn}" = fv.fk_val
+                        `.trim();
+                    }
+                    
+                    // Execute the query
+                    const result = await queueDbOperation(async () => {
+                        await new Promise(resolve => setTimeout(resolve, 50));
+                        
+                        let queryResult: any;
+                        let retryCount = 0;
+                        const maxRetries = 3;
+                        
+                        while (retryCount < maxRetries) {
+                            try {
+                                queryResult = await db.execute(sql.raw(queryStr)) as any;
+                                break;
+                            } catch (err: any) {
+                                retryCount++;
+                                if ((err?.message?.includes('WebAssembly') || err?.message?.includes('already read')) && retryCount < maxRetries) {
+                                    console.warn(`[FK Lookup] WASM error (attempt ${retryCount}/${maxRetries}), retrying...`);
+                                    await new Promise(resolve => setTimeout(resolve, 200 * retryCount));
+                                } else {
+                                    throw err;
+                                }
+                            }
+                        }
+                        
+                        return queryResult;
+                    });
+                    
+                    const resultRows = Array.isArray(result) ? result : (result?.rows || []);
+                    
+                    // Map FK values to lookup values
+                    const columnMap = new Map<string | number, any>();
+                    for (const row of resultRows) {
+                        const fkValue = row.fk_val;
+                        if (fkValue !== null && fkValue !== undefined) {
+                            if (needsNestedLookup) {
+                                // Use nested lookup value if available, otherwise fallback to intermediate
+                                const nestedLookupValue = row.nested_lookup_val;
+                                const intermediateValue = row.lookup_val;
+                                columnMap.set(fkValue, nestedLookupValue !== null && nestedLookupValue !== undefined ? nestedLookupValue : intermediateValue);
+                            } else {
+                                columnMap.set(fkValue, row.lookup_val);
+                            }
+                        }
+                    }
+                    
+                    lookupData.set(fkColumn, columnMap);
+                } catch (err) {
+                    console.error(`[FK] Error loading lookup data for ${fkColumn}:`, err);
+                    // Continue with other FK columns even if one fails
+                }
+            }
+            
+            setFKLookupData(lookupData);
+        } catch (err) {
+            console.error('[FK] Error loading FK lookup data:', err);
+            // Don't throw - just log the error so the UI can still function
+        }
+    }, [db, queueDbOperation]);
+
     // Load database connection and table list
     useEffect(() => {
         if (!dbName) return;
@@ -416,14 +989,40 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         const loadDb = async () => {
             try {
                 const entries = await getRegistryEntries();
-                const entry = entries.find(e => e.name === dbName);
+                let entry = entries.find(e => e.name === dbName);
                 if (!entry || cancelled) return;
+
+                // Ensure entry has required fields - provide defaults for PGLite if missing
+                if (!entry.dialectName || !entry.driverName) {
+                    console.warn('[table-view] Registry entry missing dialectName or driverName, using PGLite defaults:', entry);
+                    entry = {
+                        ...entry,
+                        dialectName: entry.dialectName || 'pg',
+                        driverName: entry.driverName || 'pglite',
+                    };
+                }
 
                 const db = await connect(entry);
                 if (cancelled) return;
 
                 if (!cancelled) {
                     setDb(db);
+                    
+                    // Reset ready flag when DB changes
+                    dbReadyRef.current = false;
+                    
+                    // Ensure database is ready before proceeding
+                    // This helps prevent WASM initialization issues
+                    try {
+                        if (db.db && typeof db.db.waitReady === 'function') {
+                            await db.db.waitReady;
+                        } else {
+                            // Give PGLite a moment to initialize
+                            await new Promise(resolve => setTimeout(resolve, 100));
+                        }
+                    } catch (err) {
+                        console.warn('[DB] Error waiting for DB ready:', err);
+                    }
                 }
 
                 // Load table names
@@ -449,6 +1048,37 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         loadDb();
         return () => { cancelled = true; };
     }, [dbName]);
+    
+    // Load FK metadata when table changes
+    // Add delay to avoid concurrent WASM operations with initial query
+    useEffect(() => {
+        if (db && tableName && tableName !== '') {
+            // Longer delay to ensure initial query completes and DB is fully ready
+            // This helps prevent "already read Response" errors
+            const timeoutId = setTimeout(() => {
+                loadFKMetadata(tableName);
+            }, 500);
+            
+            return () => clearTimeout(timeoutId);
+        } else {
+            setForeignKeys([]);
+            setFKLookupConfig({});
+        }
+    }, [db, tableName, loadFKMetadata]);
+    
+    // Load FK lookup data when rows or config changes
+    // Use a debounce to avoid rapid successive calls that could cause WASM issues
+    useEffect(() => {
+        if (queryResults && queryResults.rows.length > 0 && Object.keys(fkLookupConfig).length > 0) {
+            // Longer debounce to ensure FK metadata is fully loaded first and initial query is complete
+            // This helps prevent concurrent WASM operations
+            const timeoutId = setTimeout(() => {
+                loadFKLookupData(queryResults.rows, fkLookupConfig);
+            }, 600);
+            
+            return () => clearTimeout(timeoutId);
+        }
+    }, [queryResults?.rows, fkLookupConfig, loadFKLookupData]);
 
     // Helper function to extract column names from query result
     const extractColumnNames = useCallback((result: any): string[] => {
@@ -549,8 +1179,11 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
                 }
             }
             
-            // Execute query - result may be array of rows or object with rows/fields
-            const queryResult = await db.execute(rawSql) as any;
+            // Queue the query execution to prevent concurrent WASM access
+            const queryResult = await queueDbOperation(async () => {
+                // Execute query - result may be array of rows or object with rows/fields
+                return await db.execute(rawSql) as any;
+            });
 
             // Handle different result formats
             let rows: any[] = [];
@@ -640,7 +1273,7 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         } finally {
             setQueryLoading(false);
         }
-    }, [db, queryText, visibleColumns, columnOrder, extractColumnNames]);
+    }, [db, queryText, visibleColumns, columnOrder, extractColumnNames, queueDbOperation]);
 
     // Auto-execute query when table changes (query is auto-generated)
     // Only auto-execute when table/page changes, NOT when query text changes manually
@@ -654,12 +1287,18 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         // 5. Query hasn't been executed yet
         if (!db || !tableName || tableName === '' || !queryText || isQueryManuallyEdited) return;
         
-        const expectedQuery = generateDefaultQuery(tableName, page, pageSize);
+        const expectedQuery = generateDefaultQuery(tableName, page, pageSize, sortBy, sortOrder, filterText);
         
         // Only auto-execute if query exactly matches the expected query for this table/page
+        // Add delay to ensure DB is fully initialized
         if (queryText === expectedQuery && queryText !== lastExecutedQueryRef.current) {
             lastExecutedQueryRef.current = queryText;
-            executeQuery();
+            // Delay execution to ensure DB is ready and avoid WASM conflicts
+            const timeoutId = setTimeout(() => {
+                executeQuery();
+            }, 100);
+            
+            return () => clearTimeout(timeoutId);
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [db, tableName, page, pageSize, isQueryManuallyEdited]); // Only re-execute when table, page, or pageSize changes, NOT when queryText changes
@@ -672,6 +1311,13 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
 
     // Check if we're in paginated mode
     const isPaginated = (queryResults?.totalRowCount || 0) > pageSize || page > 1;
+    
+    // Check if we have ALL the data (not paginated, all rows loaded)
+    // This means we can sort/filter in-place without re-running the query
+    const hasAllData = queryResults && 
+                       queryResults.rows.length === queryResults.totalRowCount && 
+                       page === 1 &&
+                       !isPaginated;
 
     // Function to update URL via callback
     const updateURLSilently = useCallback((updates: {
@@ -741,7 +1387,7 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
                 searchParams.q = queryText;
             } else {
                 // Table mode - only include if query doesn't match the default pattern
-                const defaultQuery = generateDefaultQuery(tableName, page, pageSize);
+                const defaultQuery = generateDefaultQuery(tableName, page, pageSize, sortBy, sortOrder, filterText);
                 if (queryText.trim() !== defaultQuery.trim()) {
                     searchParams.q = queryText;
                 }
@@ -760,17 +1406,33 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         setSortBy(column);
         setSortOrder(newSortOrder);
         setPage(1); // Reset to first page when sorting
+        
+        // If we have all data, update query text but don't re-run (TableViewer handles it in-place)
+        if (hasAllData && tableName) {
+            const newQuery = generateDefaultQuery(tableName, 1, pageSize, column, newSortOrder, filterText);
+            setQueryTextSafe(newQuery);
+            // Update the cached query so opacity doesn't change
+            queryForCurrentResultsRef.current = newQuery;
+        }
+        
         updateURLSilently({ sortBy: column, sortOrder: newSortOrder, page: 1 });
-    }, [sortBy, sortOrder, updateURLSilently]);
+    }, [sortBy, sortOrder, updateURLSilently, hasAllData, tableName, pageSize, filterText, generateDefaultQuery]);
 
     // External sort handler for when paginated (database-level sorting)
     const handleSortExternal = useCallback((column: string, order: 'asc' | 'desc') => {
         setSortBy(column);
         setSortOrder(order);
         setPage(1); // Reset to first page when sorting
+        
+        // Re-run query with new sort parameters
+        if (tableName) {
+            const newQuery = generateDefaultQuery(tableName, 1, pageSize, column, order, filterText);
+            setQueryTextSafe(newQuery);
+            // Don't update cached query - let it be stale so it greys out while loading
+        }
+        
         updateURLSilently({ sortBy: column, sortOrder: order, page: 1 });
-        // The useTableData hook will automatically re-fetch with the new sort parameters
-    }, [updateURLSilently]);
+    }, [updateURLSilently, tableName, pageSize, filterText, generateDefaultQuery]);
 
     const toggleColumnVisibility = useCallback((column: string) => {
         const columnNames = queryResults?.columns.map(c => c.name) || [];
@@ -808,16 +1470,31 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
     const handleFilterChange = useCallback((text: string) => {
         setFilterText(text);
         setPage(1); // Reset to first page when filtering
-    }, []);
+        
+        // If we have all data, update query text immediately but don't re-run (TableViewer handles it in-place)
+        if (hasAllData && tableName) {
+            const newQuery = generateDefaultQuery(tableName, 1, pageSize, sortBy, sortOrder, text);
+            setQueryTextSafe(newQuery);
+            // Update the cached query so opacity doesn't change
+            queryForCurrentResultsRef.current = newQuery;
+        }
+    }, [hasAllData, tableName, pageSize, sortBy, sortOrder, generateDefaultQuery]);
 
     // External filter handler for when paginated (database-level filtering)
     const handleFilterExternal = useCallback((text: string) => {
         setFilterText(text);
         setPage(1); // Reset to first page when filtering
+        
+        // Re-run query with new filter parameters
+        if (tableName) {
+            const newQuery = generateDefaultQuery(tableName, 1, pageSize, sortBy, sortOrder, text);
+            setQueryTextSafe(newQuery);
+            // Don't update cached query - let it be stale so it greys out while loading
+        }
+        
         // Update URL immediately for external filter
         updateURLSilently({ filter: text, page: 1 });
-        // The useTableData hook will automatically re-fetch with the new filter
-    }, [updateURLSilently]);
+    }, [updateURLSilently, tableName, pageSize, sortBy, sortOrder, generateDefaultQuery]);
 
     // Debounced filter effect - update URL silently after user stops typing (only for non-paginated mode)
     useEffect(() => {
@@ -880,6 +1557,63 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         setIsQueryManuallyEdited(false); // Reset manual edit flag when selecting a new table
         // Query text will be auto-generated by useEffect when tableName changes
     }, [dbName, onNavigate]);
+    
+    // Handle FK cell click - navigate to the referenced record
+    const handleFKCellClick = useCallback((columnName: string, fkValue: any, fk: ForeignKeyInfo) => {
+        if (!dbName) return;
+        
+        // Navigate to the referenced table with a filter for the FK value
+        // We'll show the record where the referenced column equals the FK value
+        const refColumnIndex = fk.columns.indexOf(columnName);
+        const refColumn = fk.referencedColumns[refColumnIndex];
+        
+        // Navigate to the referenced table
+        // TODO: Add filter support to show the specific record
+        onNavigate(dbName, fk.referencedTable, {});
+    }, [dbName, onNavigate]);
+    
+    // Handle FK lookup config change (for configuration UI)
+    const handleFKLookupConfigChange = useCallback((config: FKLookupConfig) => {
+        console.log('[FK Config] Config changed:', config);
+        setFKLookupConfig(config);
+        // Reload lookup data with new config
+        if (queryResults && queryResults.rows.length > 0) {
+            console.log('[FK Config] Reloading FK lookup data with', queryResults.rows.length, 'rows');
+            loadFKLookupData(queryResults.rows, config);
+        } else {
+            console.warn('[FK Config] No query results available to reload FK lookup data');
+        }
+    }, [queryResults, loadFKLookupData]);
+    
+    // Handle FK config columns request - fetch available columns from referenced table
+    const handleFKConfigColumnsRequest = useCallback(async (columnName: string, fk: ForeignKeyInfo): Promise<string[]> => {
+        if (!db) return [];
+        
+        try {
+            const columns = await db.dialect.getTableColumns(db.db, fk.referencedTable, 'public');
+            return columns.map(c => c.name);
+        } catch (err) {
+            console.error('[FK Config] Error fetching columns:', err);
+            return [];
+        }
+    }, [db]);
+    
+    // Handle FK config referenced table FKs request - fetch FKs for referenced table to detect nested FKs
+    const handleFKConfigReferencedTableFKsRequest = useCallback(async (tableName: string): Promise<ForeignKeyInfo[]> => {
+        if (!db) return [];
+        
+        try {
+            const schemaFKs: SchemaForeignKeyInfo[] = await db.dialect.getTableForeignKeys(db.db, tableName, 'public');
+            return schemaFKs.map(fk => ({
+                columns: fk.columns,
+                referencedTable: fk.referencedTable,
+                referencedColumns: fk.referencedColumns,
+            }));
+        } catch (err) {
+            console.error('[FK Config] Error fetching referenced table FKs:', err);
+            return [];
+        }
+    }, [db]);
 
     // Handle no database selected - show centered database dropdown
     if (!dbName) {
@@ -938,8 +1672,11 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
                 // Check if current query differs from the query that produced these results
                 const currentQuery = typeof queryText === 'string' ? queryText.trim() : String(queryText || '').trim();
                 const resultsQuery = queryForCurrentResultsRef.current.trim();
-                const isStale = currentQuery !== resultsQuery;
-                const opacity = isStale ? 0.5 : 1.0;
+                
+                // If we have all data, the query might be updated for display purposes but results are still valid
+                // Only consider it stale if we don't have all data (need to re-run query)
+                const isStale = hasAllData ? false : (currentQuery !== resultsQuery);
+                const opacity = (isStale && queryLoading) ? 0.5 : 1.0;
                 
                 return (
                     <View style={[styles.resultsContainer, { opacity }]}>
@@ -955,23 +1692,32 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
                             setPage(newPage);
                             // Regenerate query with new page
                             if (tableName) {
-                                const newQuery = generateDefaultQuery(tableName, newPage, pageSize);
+                                const newQuery = generateDefaultQuery(tableName, newPage, pageSize, sortBy, sortOrder, filterText);
                                 setQueryTextSafe(newQuery);
                             }
                         }}
                         sortBy={sortBy}
                         sortOrder={sortOrder}
                         onSort={handleSort}
-                        sortDisabled={isPaginated}
+                        sortDisabled={isPaginated && !hasAllData}
+                        onSortExternal={isPaginated && !hasAllData ? handleSortExternal : undefined}
                         filterText={filterText}
                         onFilterChange={handleFilterChange}
-                        filterDisabled={isPaginated}
+                        filterDisabled={isPaginated && !hasAllData}
+                        onFilterExternal={isPaginated && !hasAllData ? handleFilterExternal : undefined}
                         visibleColumns={visibleColumns}
                         onToggleColumnVisibility={toggleColumnVisibility}
                         columnOrder={columnOrder}
                         onColumnOrderChange={handleColumnOrderChange}
                         columnWidths={columnWidths}
                         onColumnWidthsChange={handleColumnWidthsChange}
+                        foreignKeys={foreignKeys}
+                        fkLookupConfig={fkLookupConfig}
+                        fkLookupData={fkLookupData}
+                        onFKCellClick={handleFKCellClick}
+                        onFKLookupConfigChange={handleFKLookupConfigChange}
+                        onFKConfigColumnsRequest={handleFKConfigColumnsRequest}
+                        onFKConfigReferencedTableFKsRequest={handleFKConfigReferencedTableFKsRequest}
                     />
                 </View>
                 );

@@ -30,8 +30,10 @@ import {getDialectFromName} from "./dialects/options";
 
 export async function connect(connInfo: DbConnectionInfo): Promise<XPDatabaseConnection> {
     const driver = await connectToDriver(connInfo);
-    const dialectName = driver.dialectName;
-    const dialect = await getDialectFromName(dialectName);
+    if (!driver.dialectName) {
+        throw new Error(`Driver missing dialectName. Driver: ${JSON.stringify({ dialectName: driver.dialectName, driverName: driver.driverName, hasDialectName: 'dialectName' in driver })}`);
+    }
+    const dialect = await getDialectFromName(driver.dialectName);
     return new XPDatabaseConnection(driver, dialect);
 }
 

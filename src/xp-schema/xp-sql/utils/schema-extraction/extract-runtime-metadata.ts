@@ -33,7 +33,8 @@ function parseColumnDefault(
   columnDefault: string | null | undefined,
   dialect: SQLDialect
 ): any {
-  if (!columnDefault || columnDefault === null || columnDefault === undefined) {
+  // Handle null, undefined, and empty string as "no default"
+  if (columnDefault === null || columnDefault === undefined) {
     return undefined;
   }
 
@@ -165,16 +166,39 @@ export async function extractRuntimeTableMetadata(
   
   // Update hasDefault and defaultValue for columns that have defaults in the database
   for (const colInfo of columns) {
-    if (colInfo.columnDefault !== null && colInfo.columnDefault !== undefined) {
-      const colName = colInfo.name;
-      if (metadata.columns[colName]) {
+    const colName = colInfo.name;
+    if (metadata.columns[colName]) {
+      // Check if column has a default - handle both null/undefined and empty string
+      // columnDefault can be a string (the default value) or null/undefined (no default)
+      // PostgreSQL returns column_default as a string like 'CURRENT_TIMESTAMP'::timestamp without time zone
+      const columnDefault = colInfo.columnDefault;
+      const hasDefaultInDb = columnDefault !== null && 
+                             columnDefault !== undefined && 
+                             String(columnDefault).trim() !== '';
+      
+      // Debug logging for timestamp columns to see what we're getting
+      if (colName.includes('created_at') || colName.includes('updated_at')) {
+        console.log(`[extractRuntimeTableMetadata] Column ${colName}:`, {
+          columnDefault,
+          columnDefaultType: typeof columnDefault,
+          hasDefaultInDb,
+          currentHasDefault: metadata.columns[colName].hasDefault
+        });
+      }
+      
+      if (hasDefaultInDb) {
         // Column has a default in the database
         metadata.columns[colName].hasDefault = true;
         // Parse the default value from the database string representation
-        const parsedDefault = parseColumnDefault(colInfo.columnDefault, dialect);
+        const parsedDefault = parseColumnDefault(columnDefault, dialect);
         if (parsedDefault !== undefined) {
           metadata.columns[colName].defaultValue = parsedDefault;
         }
+      } else {
+        // Explicitly set hasDefault to false if no default in database
+        // This ensures we don't have stale hasDefault=true from the schema definition
+        metadata.columns[colName].hasDefault = false;
+        metadata.columns[colName].defaultValue = undefined;
       }
     }
   }

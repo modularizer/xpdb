@@ -40,6 +40,9 @@ let pgliteModuleCache: any = null;
 let fsBundleCache: Response | null | undefined = undefined;
 let wasmModuleCache: WebAssembly.Module | null | undefined = undefined;
 let initializationPromise: Promise<void> | null = null;
+// Global lock to prevent concurrent PGLite instance creation
+let pgliteInstanceLock: Promise<any> = Promise.resolve();
+let pgliteInstances: Map<string, any> = new Map();
 
 /**
  * Initialize PGlite early - loads module, fsBundle, and wasmModule
@@ -87,91 +90,207 @@ if (typeof window !== 'undefined') {
 }
 
 const connectToPglite: connectFn<PgliteConnectionInfo> = async ({name}: PgliteConnectionInfo)  => {
-    // Ensure resources are loaded before creating PGlite instance
-    await initializePgliteResources();
-
-    if (!pgliteModuleCache) {
-        throw new Error('PGlite module not loaded');
-    }
-
-    // Extract PGlite class from dynamically imported module
-    let PGlite: any = pgliteModuleCache.PGlite;
-
-    if (!PGlite && 'PGlite' in pgliteModuleCache) {
-        console.warn('[pglite] PGlite key exists but value is undefined/null');
-        try {
-            PGlite = pgliteModuleCache['PGlite'];
-        } catch (e) {
-            console.error('[pglite] Error accessing PGlite:', e);
-        }
-    }
-
-    if (!PGlite && pgliteModuleCache.default) {
-        if (typeof pgliteModuleCache.default === 'object') {
-            PGlite = pgliteModuleCache.default.PGlite;
-        } else if (typeof pgliteModuleCache.default === 'function') {
-            PGlite = pgliteModuleCache.default;
-        }
-    }
-
-    if (!PGlite) {
-        console.error('[pglite] PGlite module contents:', Object.keys(pgliteModuleCache));
-        throw new Error(`Failed to find PGlite in @electric-sql/pglite module. Available exports: ${Object.keys(pgliteModuleCache).join(', ')}`);
-    }
-
-    // Create PGlite instance with IndexedDB for persistent storage
-    // Metro is configured to serve PGlite's WASM and data files
-    let pgliteDb: any;
-    try {
-        console.log('[pglite] Creating PGlite instance with IndexedDB storage...');
-        // Use idb:// prefix for IndexedDB storage (persistent)
-        const PGliteCreate = PGlite.create || pgliteModuleCache.PGlite?.create || pgliteModuleCache.default?.create;
-        if (PGliteCreate) {
-            console.log('[pglite] Using PGlite.create()');
-            pgliteDb = await PGliteCreate(`idb://${name}`);
-        } else {
-            console.log('[pglite] Using PGlite constructor');
-            pgliteDb = new PGlite(`idb://${name}`);
-            await pgliteDb.waitReady;
-        }
-        console.log('[pglite] Successfully created PGlite with IndexedDB storage');
-    } catch (error: any) {
-        console.error('[pglite] Error creating PGlite:', error);
-        console.error('[pglite] Error details:', {
-            name: error?.name,
-            message: error?.message,
-            errno: error?.errno,
-            stack: error?.stack
-        });
-        throw error;
-    }
-
-    // Dynamic import to prevent Metro from analyzing
-    const { drizzle } = await import('drizzle-orm/pglite');
-    const db = drizzle(pgliteDb) as any;
-    db.raw = pgliteDb;
-    db.connInfo = {name, dialectName: 'pg', driverName: 'pglite'};
-    Object.assign(db, driverDetails);
-    
-    // Normalize execute() to return consistent QueryResult format
-    // PGlite's execute() returns Results<T> = { rows: Row<T>[], affectedRows?: number, fields: { name: string, dataTypeID: number }[] }
-    const originalExecute = db.execute.bind(db);
-    db.execute = async (query: any) => {
-        try {
-            const result = await originalExecute(query);
-            // PGlite's Results type: { rows: Row<T>[], affectedRows?: number, fields: { name: string, dataTypeID: number }[] }
-            const columns: QueryResultColumn[] = result.fields?.map((field: { name: string; dataTypeID: number }) => ({
-                name: field.name,
-                dataType: field.dataTypeID?.toString(),
-            })) || [];
+    // Check if we already have an instance for this name
+    // Note: We cache the raw pgliteDb, but we need to check if we can reuse it
+    // For now, we'll always create a new drizzle wrapper but reuse the underlying pgliteDb
+    let existingPgliteDb: any = null;
+    if (pgliteInstances.has(name)) {
+        existingPgliteDb = pgliteInstances.get(name);
+        // Verify the instance is still valid
+        if (existingPgliteDb && !existingPgliteDb.closed) {
+            console.log(`[pglite] Reusing existing PGLite instance for ${name}`);
+            // Still need to create a new drizzle wrapper, but reuse the underlying instance
+            const { drizzle } = await import('drizzle-orm/pglite');
+            const db = drizzle(existingPgliteDb) as any;
+            db.raw = existingPgliteDb;
+            db.connInfo = {name, dialectName: 'pg', driverName: 'pglite'};
+            // Explicitly set driverDetails properties to ensure they're set
+            db.dialectName = driverDetails.dialectName;
+            db.driverName = driverDetails.driverName;
+            Object.assign(db, driverDetails);
             
-            return {
-                rows: result.rows || [],
-                columns: columns,
-                rowCount: result.rows?.length || 0,
-                affectedRows: result.affectedRows,
-            } as unknown as QueryResult;
+            // Re-wrap execute to normalize results
+            const originalExecute = db.execute.bind(db);
+            db.execute = async (query: any) => {
+                try {
+                    const result = await originalExecute(query);
+                    const columns: QueryResultColumn[] = result.fields?.map((field: { name: string; dataTypeID: number }) => ({
+                        name: field.name,
+                        dataType: field.dataTypeID?.toString(),
+                    })) || [];
+                    
+                    return {
+                        rows: result.rows || [],
+                        columns: columns,
+                        rowCount: result.rows?.length || 0,
+                        affectedRows: result.affectedRows,
+                    } as unknown as QueryResult;
+                } catch (error: any) {
+                    // Error handling (same as below)
+                    throw error;
+                }
+            };
+            
+            return db;
+        } else {
+            // Instance was closed, remove it
+            pgliteInstances.delete(name);
+        }
+    }
+    
+    // Wait for any ongoing instance creation to complete
+    await pgliteInstanceLock;
+    
+    // Check again after waiting (another thread might have created it)
+    if (pgliteInstances.has(name)) {
+        const existingPgliteDb = pgliteInstances.get(name);
+        if (existingPgliteDb && !existingPgliteDb.closed) {
+            console.log(`[pglite] Reusing existing PGLite instance for ${name} (after lock)`);
+            // Still need to create a new drizzle wrapper, but reuse the underlying instance
+            const { drizzle } = await import('drizzle-orm/pglite');
+            const db = drizzle(existingPgliteDb) as any;
+            db.raw = existingPgliteDb;
+            db.connInfo = {name, dialectName: 'pg', driverName: 'pglite'};
+            // Explicitly set driverDetails properties to ensure they're set
+            db.dialectName = driverDetails.dialectName;
+            db.driverName = driverDetails.driverName;
+            Object.assign(db, driverDetails);
+            
+            // Re-wrap execute to normalize results
+            const originalExecute = db.execute.bind(db);
+            db.execute = async (query: any) => {
+                try {
+                    const result = await originalExecute(query);
+                    const columns: QueryResultColumn[] = result.fields?.map((field: { name: string; dataTypeID: number }) => ({
+                        name: field.name,
+                        dataType: field.dataTypeID?.toString(),
+                    })) || [];
+                    
+                    return {
+                        rows: result.rows || [],
+                        columns: columns,
+                        rowCount: result.rows?.length || 0,
+                        affectedRows: result.affectedRows,
+                    } as unknown as QueryResult;
+                } catch (error: any) {
+                    throw error;
+                }
+            };
+            
+            // Verify dialectName is set before returning
+            if (!db.dialectName) {
+                throw new Error(`Failed to set dialectName on db object. driverDetails: ${JSON.stringify(driverDetails)}`);
+            }
+            
+            return db;
+        }
+    }
+    
+    // Create a new promise for this instance creation
+    let resolveInstance: (value: any) => void;
+    let rejectInstance: (error: any) => void;
+    const instancePromise = new Promise<any>((resolve, reject) => {
+        resolveInstance = resolve;
+        rejectInstance = reject;
+    });
+    
+    // Update the lock
+    pgliteInstanceLock = instancePromise.catch(() => {}).then(() => {});
+    
+    try {
+        // Ensure resources are loaded before creating PGlite instance
+        await initializePgliteResources();
+
+        if (!pgliteModuleCache) {
+            throw new Error('PGlite module not loaded');
+        }
+
+        // Extract PGlite class from dynamically imported module
+        let PGlite: any = pgliteModuleCache.PGlite;
+
+        if (!PGlite && 'PGlite' in pgliteModuleCache) {
+            console.warn('[pglite] PGlite key exists but value is undefined/null');
+            try {
+                PGlite = pgliteModuleCache['PGlite'];
+            } catch (e) {
+                console.error('[pglite] Error accessing PGlite:', e);
+            }
+        }
+
+        if (!PGlite && pgliteModuleCache.default) {
+            if (typeof pgliteModuleCache.default === 'object') {
+                PGlite = pgliteModuleCache.default.PGlite;
+            } else if (typeof pgliteModuleCache.default === 'function') {
+                PGlite = pgliteModuleCache.default;
+            }
+        }
+
+        if (!PGlite) {
+            console.error('[pglite] PGlite module contents:', Object.keys(pgliteModuleCache));
+            throw new Error(`Failed to find PGlite in @electric-sql/pglite module. Available exports: ${Object.keys(pgliteModuleCache).join(', ')}`);
+        }
+
+        // Create PGlite instance with IndexedDB for persistent storage
+        // Metro is configured to serve PGlite's WASM and data files
+        let pgliteDb: any;
+        try {
+            console.log('[pglite] Creating PGlite instance with IndexedDB storage...');
+            // Use idb:// prefix for IndexedDB storage (persistent)
+            const PGliteCreate = PGlite.create || pgliteModuleCache.PGlite?.create || pgliteModuleCache.default?.create;
+            if (PGliteCreate) {
+                console.log('[pglite] Using PGlite.create()');
+                pgliteDb = await PGliteCreate(`idb://${name}`);
+            } else {
+                console.log('[pglite] Using PGlite constructor');
+                pgliteDb = new PGlite(`idb://${name}`);
+                await pgliteDb.waitReady;
+            }
+            console.log('[pglite] Successfully created PGlite with IndexedDB storage');
+            
+            // Ensure PGLite instance is fully ready before creating drizzle wrapper
+            if (pgliteDb.waitReady) {
+                await pgliteDb.waitReady;
+            }
         } catch (error: any) {
+            console.error('[pglite] Error creating PGlite:', error);
+            console.error('[pglite] Error details:', {
+                name: error?.name,
+                message: error?.message,
+                errno: error?.errno,
+                stack: error?.stack
+            });
+            throw error;
+        }
+        
+        // Dynamic import to prevent Metro from analyzing
+        const { drizzle } = await import('drizzle-orm/pglite');
+        const db = drizzle(pgliteDb) as any;
+        db.raw = pgliteDb;
+        db.connInfo = {name, dialectName: 'pg', driverName: 'pglite'};
+        // Explicitly set driverDetails properties to ensure they're set
+        db.dialectName = driverDetails.dialectName;
+        db.driverName = driverDetails.driverName;
+        Object.assign(db, driverDetails);
+        
+        // Normalize execute() to return consistent QueryResult format
+        // PGlite's execute() returns Results<T> = { rows: Row<T>[], affectedRows?: number, fields: { name: string, dataTypeID: number }[] }
+        const originalExecute = db.execute.bind(db);
+        db.execute = async (query: any) => {
+            try {
+                const result = await originalExecute(query);
+                // PGlite's Results type: { rows: Row<T>[], affectedRows?: number, fields: { name: string, dataTypeID: number }[] }
+                const columns: QueryResultColumn[] = result.fields?.map((field: { name: string; dataTypeID: number }) => ({
+                    name: field.name,
+                    dataType: field.dataTypeID?.toString(),
+                })) || [];
+                
+                return {
+                    rows: result.rows || [],
+                    columns: columns,
+                    rowCount: result.rows?.length || 0,
+                    affectedRows: result.affectedRows,
+                } as unknown as QueryResult;
+            } catch (error: any) {
             // Extract query details for debugging
             let queryStr = 'unknown';
             let params: any[] = [];
@@ -401,7 +520,21 @@ const connectToPglite: connectFn<PgliteConnectionInfo> = async ({name}: PgliteCo
             };
         });
     }
+    
+    // Ensure execute is set before returning
+    if (typeof db.execute !== 'function') {
+        throw new Error('Failed to wrap db.execute - execute function is missing after wrapping');
+    }
+    
+    // Cache the instance (cache the raw pgliteDb, not the wrapped db)
+    pgliteInstances.set(name, pgliteDb);
+    
+    resolveInstance!(db);
     return db as DrizzleDatabaseConnectionDriver<PgliteConnectionInfo>;
+    } catch (error) {
+        rejectInstance!(error);
+        throw error;
+    }
 }
 
 export const pgliteDriver: XPDriverImpl = {

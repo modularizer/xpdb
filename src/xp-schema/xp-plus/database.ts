@@ -93,8 +93,10 @@ export async function connect<TTables extends Record<string, Table | any> = Reco
     schema?: TTables | string
 ): Promise<XPDatabaseConnectionPlusWithTables<TTables>> {
     const driver = await connectToDriver(connInfo);
-    const dialectName = driver.dialectName;
-    const dialect = await getDialectFromName(dialectName);
+    if (!driver.dialectName) {
+        throw new Error(`Driver missing dialectName. Driver: ${JSON.stringify({ dialectName: driver.dialectName, driverName: driver.driverName, hasDialectName: 'dialectName' in driver })}`);
+    }
+    const dialect = await getDialectFromName(driver.dialectName);
     
     // Ensure connection info includes dialectName and driverName from the driver
     const fullConnInfo: DbConnectionInfo = {
@@ -113,7 +115,7 @@ export class XPDatabaseConnectionPlus<TTables extends Record<string, Table> = Re
     tables: Record<string, XPDatabaseTablePlus> = {};
     schema: Record<string, Table> = {};
     schemaPromise: Promise<void>;
-
+    private runtimeSchemaCache: Map<string, Promise<Record<string, Table>>> = new Map();
 
     constructor(
         db: DrizzleDatabaseConnectionDriver,
@@ -126,12 +128,17 @@ export class XPDatabaseConnectionPlus<TTables extends Record<string, Table> = Re
 
     registerSchema(schema?: Record<string, Table> | string): Promise<void> {
         if (!schema) {
-            return this.detectRuntimeSchema().then((detectedSchema) => {
-                console.log('[XPDatabaseConnectionPlus] Detected runtime schema:', Object.keys(detectedSchema));
-                return this.registerSchema(detectedSchema);
-            });
+            // Don't automatically detect runtime schema - this causes performance issues
+            // Schema detection should only happen when explicitly requested (e.g., createOrMigrate, isSchemaUpToDate)
+            // If no schema is provided, leave it empty - users can call detectRuntimeSchema() explicitly if needed
+            return Promise.resolve();
         }else if (typeof schema === "string"){
-            return this.detectRuntimeSchema(schema).then((detectedSchema) => {
+            // Cache runtime schema detection per schema name to avoid multiple calls
+            const cacheKey = schema;
+            if (!this.runtimeSchemaCache.has(cacheKey)) {
+                this.runtimeSchemaCache.set(cacheKey, this.detectRuntimeSchema(schema));
+            }
+            return this.runtimeSchemaCache.get(cacheKey)!.then((detectedSchema) => {
                 console.log(`[XPDatabaseConnectionPlus] Detected runtime schema (${schema}):`, Object.keys(detectedSchema));
                 return this.registerSchema(detectedSchema);
             });
@@ -178,46 +185,8 @@ export class XPDatabaseConnectionPlus<TTables extends Record<string, Table> = Re
             this[tableName] = this.getTable(table);
         }
         
-        // After schema is registered, detect runtime schema and compare
-        this.detectRuntimeSchema().then(async (runtimeSchema) => {
-            const runtimeTableNames = Object.keys(runtimeSchema);
-            const schemaTableNames = Object.keys(boundSchema);
-            
-            console.log('[XPDatabaseConnectionPlus] Runtime schema detected:', runtimeTableNames);
-            console.log('[XPDatabaseConnectionPlus] Target schema (passed in):', schemaTableNames);
-            
-            const targetMetadata = await getSchemaJsonFromBoundTables(boundSchema, this.dialect.dialectName as 'sqlite' | 'pg');
-            const liveMetadata = await extractRuntimeSchemaMetadata(this.db, this.dialect, 'public');
-            
-            const liveTableNames = new Set(Object.keys(liveMetadata));
-            const targetTableNames = new Set(Object.keys(targetMetadata));
-            
-            const diff: SchemaDiff = {
-                addedTables: Array.from(targetTableNames).filter(t => !liveTableNames.has(t)),
-                removedTables: Array.from(liveTableNames).filter(t => !targetTableNames.has(t)),
-                modifiedTables: [],
-            };
-            
-            for (const tableName of liveTableNames) {
-                if (targetTableNames.has(tableName)) {
-                    const tableDiff = compareTables(liveMetadata[tableName], targetMetadata[tableName]);
-                    if (tableDiff) {
-                        diff.modifiedTables.push(tableDiff);
-                    }
-                }
-            }
-            
-            console.log('[XPDatabaseConnectionPlus] Schema diff:', {
-                addedTables: diff.addedTables,
-                removedTables: diff.removedTables,
-                modifiedTables: diff.modifiedTables.map((t: any) => ({
-                    tableName: t.tableName,
-                    addedColumns: t.addedColumns,
-                    removedColumns: t.removedColumns,
-                    modifiedColumns: t.modifiedColumns?.map((c: any) => c.columnName),
-                })),
-            });
-        });
+        // Don't automatically compare schemas on registration - this causes performance issues
+        // Schema comparison should only happen when explicitly requested (e.g., createOrMigrate, isSchemaUpToDate)
         
         return Promise.resolve();
     }
