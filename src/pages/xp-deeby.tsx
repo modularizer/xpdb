@@ -13,7 +13,7 @@ import {
 import { useLocalSearchParams } from 'expo-router';
 import { connect, getRegistryEntries } from '../xp-schema';
 import { sql } from 'drizzle-orm';
-import TableViewer, { TableViewerColumn, TableViewerRow, ForeignKeyInfo, FKLookupConfig } from '../components/TableViewer';
+import TableViewer, { TableViewerColumn, TableViewerRow, ForeignKeyInfo, FKLookupConfig, FKLookupColumn } from '../components/TableViewer';
 import QueryEditor from '../components/QueryEditor';
 import DatabaseBrowserLayout, { SidebarContext, NavigateCallback } from '../components/DatabaseBrowserLayout';
 import { determineLookupColumn, getFKForColumn, getReferencedColumn } from '../utils/fk-utils';
@@ -337,6 +337,8 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
     const [foreignKeys, setForeignKeys] = useState<ForeignKeyInfo[]>([]);
     const [fkLookupConfig, setFKLookupConfig] = useState<FKLookupConfig>({});
     const [fkLookupData, setFKLookupData] = useState<Map<string, Map<string | number, any>>>(new Map());
+    // Cache for FK record data (for hover)
+    const fkRecordCacheRef = useRef<Map<string, Record<string, any> | null>>(new Map());
 
     // Generate default query based on table name, pagination, sorting, and filtering
     const generateDefaultQuery = useCallback((
@@ -352,25 +354,13 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         // Ensure table name is properly escaped and doesn't contain brackets
         const safeTableName = String(table).replace(/[\[\]]/g, '');
         
-        // Check if we need JOINs for FK lookups (for sorting/filtering)
-        const needsJoinForSort = currentSortBy && fkLookupConfig[currentSortBy];
-        const needsJoinForFilter = currentFilterText && Object.keys(fkLookupConfig).some(fkCol => {
-            // Check if filter text might match this FK column (simple heuristic)
-            return currentFilterText && currentFilterText.trim().length > 0;
-        });
-        
-        // Find all FK columns that need JOINs (for sorting or filtering)
+        // Find all FK columns that have lookup columns configured (always add JOINs for these)
         const fkColumnsNeedingJoin = new Set<string>();
-        if (needsJoinForSort && currentSortBy) {
-            fkColumnsNeedingJoin.add(currentSortBy);
-        }
-        // For filtering, we need to check all FK columns - we'll add JOINs for all configured FKs
-        // and filter on the lookup columns
-        if (currentFilterText && currentFilterText.trim()) {
-            Object.keys(fkLookupConfig).forEach(fkCol => {
+        Object.entries(fkLookupConfig).forEach(([fkCol, config]) => {
+            if (config.lookupColumns && config.lookupColumns.length > 0) {
                 fkColumnsNeedingJoin.add(fkCol);
-            });
-        }
+            }
+        });
         
         // Build JOINs and SELECT columns
         const joins: string[] = [];
@@ -378,32 +368,55 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         let joinAliasCounter = 1;
         const joinAliases = new Map<string, string>(); // Map FK column -> table alias
         
-        // Add JOINs for each FK column that needs it
+        // Add JOINs for each FK column that has lookup columns configured
         for (const fkColumn of fkColumnsNeedingJoin) {
             const fkConfig = fkLookupConfig[fkColumn];
-            if (!fkConfig) continue;
+            if (!fkConfig || !fkConfig.lookupColumns || fkConfig.lookupColumns.length === 0) continue;
             
-            const refTable = fkConfig.fk.referencedTable;
-            const fkColIndex = fkConfig.fk.columns.indexOf(fkColumn);
-            const refColumn = fkConfig.fk.referencedColumns[fkColIndex];
-            const lookupCol = fkConfig.lookupColumn;
+            // Get the FK info from the first lookup column (they all reference the same table)
+            const firstLookup = fkConfig.lookupColumns[0];
+            const refTable = firstLookup.fk.referencedTable;
+            
+            // Find the FK for this column
+            const fk = foreignKeys.find(f => f.columns.includes(fkColumn));
+            if (!fk) continue;
+            
+            const fkColIndex = fk.columns.indexOf(fkColumn);
+            const refColumn = fk.referencedColumns[fkColIndex];
             const alias = `t${joinAliasCounter++}`;
             joinAliases.set(fkColumn, alias);
             
             // Add JOIN
             joins.push(`LEFT JOIN "${refTable}" ${alias} ON ${alias}."${refColumn}" = "${safeTableName}"."${fkColumn}"`);
             
-            // Add nested FK JOIN if needed
-            if (fkConfig.nestedFK) {
-                const nestedFK = fkConfig.nestedFK;
-                const nestedRefTable = nestedFK.fk.referencedTable;
-                const nestedFKCol = nestedFK.fk.columns[0];
-                const nestedRefCol = nestedFK.fk.referencedColumns[0];
-                const nestedLookupCol = nestedFK.lookupColumn;
-                const nestedAlias = `t${joinAliasCounter++}`;
-                
-                joins.push(`LEFT JOIN "${nestedRefTable}" ${nestedAlias} ON ${nestedAlias}."${nestedRefCol}" = ${alias}."${nestedFKCol}"`);
-                joinAliases.set(`${fkColumn}_nested`, nestedAlias);
+            // Add nested FK JOINs for each lookup column that has nested FK
+            for (const lookup of fkConfig.lookupColumns) {
+                if (lookup.nestedFK) {
+                    const nestedFK = lookup.nestedFK;
+                    const nestedRefTable = nestedFK.fk.referencedTable;
+                    const nestedFKCol = nestedFK.fk.columns[0];
+                    const nestedRefCol = nestedFK.fk.referencedColumns[0];
+                    const nestedAlias = `t${joinAliasCounter++}`;
+                    
+                    joins.push(`LEFT JOIN "${nestedRefTable}" ${nestedAlias} ON ${nestedAlias}."${nestedRefCol}" = ${alias}."${nestedFKCol}"`);
+                    joinAliases.set(`${fkColumn}_${lookup.lookupColumn}_nested`, nestedAlias);
+                }
+            }
+            
+            // Add SELECT columns for all lookup columns
+            for (const lookup of fkConfig.lookupColumns) {
+                if (lookup.nestedFK) {
+                    const nestedAlias = joinAliases.get(`${fkColumn}_${lookup.lookupColumn}_nested`);
+                    if (nestedAlias) {
+                        // Generate a column name like: fk_column_name->lookup_column_name
+                        const lookupColumnName = `${fkColumn}->${lookup.nestedFK.lookupColumn}`;
+                        selectColumns.push(`${nestedAlias}."${lookup.nestedFK.lookupColumn}" AS "${lookupColumnName}"`);
+                    }
+                } else {
+                    // Generate a column name like: fk_column_name->lookup_column_name
+                    const lookupColumnName = `${fkColumn}->${lookup.lookupColumn}`;
+                    selectColumns.push(`${alias}."${lookup.lookupColumn}" AS "${lookupColumnName}"`);
+                }
             }
         }
         
@@ -414,22 +427,24 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
             const escapedFilter = filterText.replace(/'/g, "''");
             const conditions: string[] = [];
             
-            // Get all columns from the table (we'll need to query for this, but for now use a simple approach)
-            // For FK columns with lookup config, filter on the lookup column
-            for (const fkColumn of Object.keys(fkLookupConfig)) {
-                const fkConfig = fkLookupConfig[fkColumn];
+            // For FK columns with lookup columns configured, filter on the lookup columns
+            for (const [fkColumn, fkConfig] of Object.entries(fkLookupConfig)) {
+                if (!fkConfig.lookupColumns || fkConfig.lookupColumns.length === 0) continue;
+                
                 const alias = joinAliases.get(fkColumn);
                 if (alias) {
-                    // Use nested lookup column if available, otherwise use intermediate lookup column
-                    if (fkConfig.nestedFK) {
-                        const nestedAlias = joinAliases.get(`${fkColumn}_nested`);
-                        if (nestedAlias) {
-                            conditions.push(`${nestedAlias}."${fkConfig.nestedFK.lookupColumn}" ILIKE '%${escapedFilter}%'`);
+                    // Filter on all lookup columns for this FK
+                    for (const lookup of fkConfig.lookupColumns) {
+                        if (lookup.nestedFK) {
+                            const nestedAlias = joinAliases.get(`${fkColumn}_${lookup.lookupColumn}_nested`);
+                            if (nestedAlias) {
+                                conditions.push(`${nestedAlias}."${lookup.nestedFK.lookupColumn}" ILIKE '%${escapedFilter}%'`);
+                            } else {
+                                conditions.push(`${alias}."${lookup.lookupColumn}" ILIKE '%${escapedFilter}%'`);
+                            }
                         } else {
-                            conditions.push(`${alias}."${fkConfig.lookupColumn}" ILIKE '%${escapedFilter}%'`);
+                            conditions.push(`${alias}."${lookup.lookupColumn}" ILIKE '%${escapedFilter}%'`);
                         }
-                    } else {
-                        conditions.push(`${alias}."${fkConfig.lookupColumn}" ILIKE '%${escapedFilter}%'`);
                     }
                 }
             }
@@ -450,28 +465,76 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         // Build ORDER BY clause
         let orderByClause = '';
         if (currentSortBy) {
-            const fkConfig = fkLookupConfig[currentSortBy];
-            if (fkConfig) {
-                // Sort by lookup column
-                const alias = joinAliases.get(currentSortBy);
-                if (alias) {
-                    // Use nested lookup column if available
-                    if (fkConfig.nestedFK) {
-                        const nestedAlias = joinAliases.get(`${currentSortBy}_nested`);
-                        if (nestedAlias) {
-                            orderByClause = `ORDER BY ${nestedAlias}."${fkConfig.nestedFK.lookupColumn}" ${currentSortOrder || 'asc'}`;
-                        } else {
-                            orderByClause = `ORDER BY ${alias}."${fkConfig.lookupColumn}" ${currentSortOrder || 'asc'}`;
+            // Check if sorting by a lookup column (format: fkColumn->lookupColumn or fkColumn->intermediateColumn->nestedColumn)
+            const lookupMatch = currentSortBy.match(/^(.+?)(?:->(.+))?$/);
+            if (lookupMatch) {
+                const [, fkColumn, lookupPath] = lookupMatch;
+                const fkConfig = fkLookupConfig[fkColumn];
+                
+                if (fkConfig?.lookupColumns && fkConfig.lookupColumns.length > 0) {
+                    // Find the matching lookup column
+                    // The lookupPath could be just "last_name" for nested lookups like "winner_id->last_name"
+                    // where winner_id -> person_id -> last_name
+                    let matchingLookup: FKLookupColumn | null = null;
+                    if (lookupPath) {
+                        // Try to find a lookup that matches the final column name
+                        // First try direct match (no nested FK)
+                        matchingLookup = fkConfig.lookupColumns.find(lc => 
+                            lc.lookupColumn === lookupPath && !lc.nestedFK
+                        ) || null;
+                        
+                        // If not found, try nested FK match
+                        if (!matchingLookup) {
+                            matchingLookup = fkConfig.lookupColumns.find(lc => 
+                                lc.nestedFK?.lookupColumn === lookupPath
+                            ) || null;
+                        }
+                        
+                        // If still not found, try parsing as path (e.g., "person_id->last_name")
+                        if (!matchingLookup) {
+                            const pathParts = lookupPath.split('->');
+                            if (pathParts.length === 2) {
+                                matchingLookup = fkConfig.lookupColumns.find(lc => 
+                                    lc.lookupColumn === pathParts[0] && 
+                                    lc.nestedFK?.lookupColumn === pathParts[1]
+                                ) || null;
+                            }
                         }
                     } else {
-                        orderByClause = `ORDER BY ${alias}."${fkConfig.lookupColumn}" ${currentSortOrder || 'asc'}`;
+                        // No path specified, use first lookup column
+                        matchingLookup = fkConfig.lookupColumns[0];
+                    }
+                    
+                    if (matchingLookup) {
+                        const alias = joinAliases.get(fkColumn);
+                        if (alias) {
+                            if (matchingLookup.nestedFK) {
+                                // For nested lookups, use the nested alias
+                                const nestedAlias = joinAliases.get(`${fkColumn}_${matchingLookup.lookupColumn}_nested`);
+                                if (nestedAlias) {
+                                    orderByClause = `ORDER BY ${nestedAlias}."${matchingLookup.nestedFK.lookupColumn}" ${currentSortOrder || 'asc'}`;
+                                } else {
+                                    // Fallback to intermediate table
+                                    orderByClause = `ORDER BY ${alias}."${matchingLookup.lookupColumn}" ${currentSortOrder || 'asc'}`;
+                                }
+                            } else {
+                                // Direct lookup
+                                orderByClause = `ORDER BY ${alias}."${matchingLookup.lookupColumn}" ${currentSortOrder || 'asc'}`;
+                            }
+                        } else {
+                            // Fallback to FK column if JOIN wasn't added
+                            orderByClause = `ORDER BY "${safeTableName}"."${fkColumn}" ${currentSortOrder || 'asc'}`;
+                        }
+                    } else {
+                        // Lookup column not found, fallback to regular column
+                        orderByClause = `ORDER BY "${safeTableName}"."${currentSortBy}" ${currentSortOrder || 'asc'}`;
                     }
                 } else {
-                    // Fallback to FK column if JOIN wasn't added
+                    // Not a lookup column or no config, treat as regular column
                     orderByClause = `ORDER BY "${safeTableName}"."${currentSortBy}" ${currentSortOrder || 'asc'}`;
                 }
             } else {
-                // Regular column sorting
+                // Regular column sorting (no -> in name)
                 orderByClause = `ORDER BY "${safeTableName}"."${currentSortBy}" ${currentSortOrder || 'asc'}`;
             }
         }
@@ -481,7 +544,7 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         const query = `SELECT ${selectColumns.join(', ')} FROM "${safeTableName}"${joinClause} ${whereClause} ${orderByClause} LIMIT ${currentPageSize} OFFSET ${offset}`.trim();
         
         return query;
-    }, [fkLookupConfig]);
+    }, [fkLookupConfig, foreignKeys]);
 
     // Track if query was manually edited (not auto-generated)
     const [isQueryManuallyEdited, setIsQueryManuallyEdited] = useState(false);
@@ -518,6 +581,7 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
             const tableChanged = tableName !== lastTableRef.current;
             // Only update if query actually changed to avoid unnecessary re-renders
             if (newQuery !== lastGeneratedQueryRef.current) {
+                const queryChanged = newQuery !== lastGeneratedQueryRef.current;
                 lastGeneratedQueryRef.current = newQuery;
                 lastTableRef.current = tableName;
                 // Mark that we're updating programmatically
@@ -529,8 +593,8 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
                 // Reset execution tracking when query changes
                 lastExecutedQueryRef.current = '';
                 
-                // If table changed and db is loaded, execute query immediately with the new query
-                if (tableChanged && db && !isQueryManuallyEdited) {
+                // If table changed OR query changed (e.g., due to FK lookup config), and db is loaded, execute query immediately
+                if ((tableChanged || queryChanged) && db && !isQueryManuallyEdited) {
                     // Execute with the new query directly to avoid state timing issues
                     if (newQuery !== lastExecutedQueryRef.current) {
                         lastExecutedQueryRef.current = newQuery;
@@ -546,7 +610,7 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
             }
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [tableName, page, pageSize, sortBy, sortOrder, filterText, generateDefaultQuery, db]);
+    }, [tableName, page, pageSize, sortBy, sortOrder, filterText, generateDefaultQuery, db, fkLookupConfig]);
 
     // Detect manual query edits and parse query to determine mode
     // Use a ref to track if this is the initial mount to avoid false positives
@@ -1219,10 +1283,57 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
                 : extractColumnNames(rows);
 
             // Convert results to TableViewer format
-            const columns: TableViewerColumn[] = columnNames.map(name => ({
-                name,
-                label: name,
-            }));
+            // First, identify lookup columns and reorder them to appear after their FK columns
+            const reorderedColumnNames: string[] = [];
+            const processedColumns = new Set<string>();
+            
+            // Process columns in order, inserting lookup columns after their FK columns
+            for (const colName of columnNames) {
+                // Check if this is a lookup column (format: fkColumn->lookupColumn)
+                const lookupMatch = colName.match(/^(.+)->(.+)$/);
+                if (lookupMatch) {
+                    const [, fkColumn, lookupColumn] = lookupMatch;
+                    // Find the FK column in the list and insert this lookup column right after it
+                    const fkIndex = reorderedColumnNames.indexOf(fkColumn);
+                    if (fkIndex >= 0) {
+                        // Insert right after the FK column
+                        reorderedColumnNames.splice(fkIndex + 1, 0, colName);
+                    } else {
+                        // FK column not found yet, add lookup column at the end for now
+                        reorderedColumnNames.push(colName);
+                    }
+                    processedColumns.add(colName);
+                } else {
+                    // Regular column - add it if not already processed
+                    if (!processedColumns.has(colName)) {
+                        reorderedColumnNames.push(colName);
+                        processedColumns.add(colName);
+                    }
+                }
+            }
+            
+            // Add any remaining columns that weren't processed
+            for (const colName of columnNames) {
+                if (!processedColumns.has(colName)) {
+                    reorderedColumnNames.push(colName);
+                }
+            }
+            
+            const columns: TableViewerColumn[] = reorderedColumnNames.map(name => {
+                // Check if this is a lookup column and format the label
+                const lookupMatch = name.match(/^(.+)->(.+)$/);
+                if (lookupMatch) {
+                    const [, fkColumn, lookupColumn] = lookupMatch;
+                    return {
+                        name,
+                        label: `→ ${lookupColumn}`, // Visual indication with arrow
+                    };
+                }
+                return {
+                    name,
+                    label: name,
+                };
+            });
 
             const tableRows: TableViewerRow[] = rows.map((row, index) => {
                 const rowData: TableViewerRow = { id: `row_${index}` };
@@ -1257,12 +1368,24 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
             // Cache the exact query that produced these results
             queryForCurrentResultsRef.current = cleanQuery;
 
-            // Set visible columns if not already set
+            // Set visible columns - include all columns, especially new lookup columns
             if (!visibleColumns) {
-                setVisibleColumns(new Set(columnNames));
+                // null means all columns visible, so we can keep it null
+                // But if we have a Set, we need to add new columns to it
+            } else {
+                // visibleColumns is a Set, so add any new columns (e.g., new lookup columns)
+                const newVisibleColumns = new Set(visibleColumns);
+                reorderedColumnNames.forEach(colName => {
+                    newVisibleColumns.add(colName);
+                });
+                setVisibleColumns(newVisibleColumns);
             }
-            if (!columnOrder || columnOrder.length === 0) {
-                setColumnOrder(columnNames);
+            
+            // Update column order to match the reordered columns (only if it's different)
+            if (!columnOrder || columnOrder.length === 0 || 
+                columnOrder.length !== reorderedColumnNames.length ||
+                columnOrder.some((col, idx) => col !== reorderedColumnNames[idx])) {
+                setColumnOrder(reorderedColumnNames);
             }
         } catch (err) {
             console.error('[table-view] Error executing query:', err);
@@ -1576,14 +1699,9 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
     const handleFKLookupConfigChange = useCallback((config: FKLookupConfig) => {
         console.log('[FK Config] Config changed:', config);
         setFKLookupConfig(config);
-        // Reload lookup data with new config
-        if (queryResults && queryResults.rows.length > 0) {
-            console.log('[FK Config] Reloading FK lookup data with', queryResults.rows.length, 'rows');
-            loadFKLookupData(queryResults.rows, config);
-        } else {
-            console.warn('[FK Config] No query results available to reload FK lookup data');
-        }
-    }, [queryResults, loadFKLookupData]);
+        // The query will be regenerated automatically via the useEffect that watches fkLookupConfig
+        // We'll trigger a query execution after the query text updates
+    }, []);
     
     // Handle FK config columns request - fetch available columns from referenced table
     const handleFKConfigColumnsRequest = useCallback(async (columnName: string, fk: ForeignKeyInfo): Promise<string[]> => {
@@ -1718,6 +1836,51 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
                         onFKLookupConfigChange={handleFKLookupConfigChange}
                         onFKConfigColumnsRequest={handleFKConfigColumnsRequest}
                         onFKConfigReferencedTableFKsRequest={handleFKConfigReferencedTableFKsRequest}
+                        onFKRecordRequest={async (fkColumn: string, fkValue: any, fk: ForeignKeyInfo) => {
+                            if (!db) return null;
+                            
+                            // Check cache first
+                            const cacheKey = `${fkColumn}:${fkValue}`;
+                            const cached = fkRecordCacheRef.current.get(cacheKey);
+                            if (cached !== undefined) {
+                                return cached;
+                            }
+                            
+                            // If not in cache, fetch it
+                            try {
+                                // Get the referenced column name
+                                const fkColIndex = fk.columns.indexOf(fkColumn);
+                                const refColumn = fk.referencedColumns[fkColIndex];
+                                
+                                // Build query to fetch the foreign record
+                                const safeValue = typeof fkValue === 'string' 
+                                    ? `'${fkValue.replace(/'/g, "''")}'` 
+                                    : String(fkValue);
+                                const queryStr = `SELECT * FROM "${fk.referencedTable}" WHERE "${refColumn}" = ${safeValue} LIMIT 1`;
+                                
+                                const result = await queueDbOperation(async () => {
+                                    return await db.execute(sql.raw(queryStr)) as any;
+                                });
+                                
+                                const rows = Array.isArray(result) ? result : (result?.rows || []);
+                                const record = rows.length > 0 ? rows[0] : null;
+                                
+                                // Cache the result
+                                fkRecordCacheRef.current.set(cacheKey, record);
+                                
+                                return record;
+                            } catch (err) {
+                                console.error('[FK Record] Error fetching foreign record:', err);
+                                // Cache null to avoid repeated failed requests
+                                fkRecordCacheRef.current.set(cacheKey, null);
+                                return null;
+                            }
+                        }}
+                        onNavigateToTable={(tableName: string, rowId: any, fk: ForeignKeyInfo) => {
+                            // Navigate to the foreign table with a filter for the row
+                            const refColumn = fk.referencedColumns[0];
+                            onNavigate(dbName, tableName, { filter: `${refColumn}=${rowId}` });
+                        }}
                     />
                 </View>
                 );

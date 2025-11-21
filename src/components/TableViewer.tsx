@@ -35,15 +35,22 @@ export interface ForeignKeyInfo {
   referencedColumns: string[];
 }
 
-export interface FKLookupConfig {
-  [columnName: string]: {
+export interface FKLookupColumn {
+  fk: ForeignKeyInfo;
+  lookupColumn: string;
+  nestedFK?: {
+    // If the lookup column is itself an FK, this contains the nested FK config
+    // Supports recursive nesting for chained lookups
     fk: ForeignKeyInfo;
     lookupColumn: string;
-    nestedFK?: {
-      // If the lookup column is itself an FK, this contains the nested FK config
-      fk: ForeignKeyInfo;
-      lookupColumn: string;
-    };
+    nestedFK?: FKLookupColumn['nestedFK']; // Recursive type for deeper nesting
+  };
+}
+
+export interface FKLookupConfig {
+  [columnName: string]: {
+    // Lookup columns that have been added to the table for this FK
+    lookupColumns: FKLookupColumn[];
   };
 }
 
@@ -95,6 +102,10 @@ export interface TableViewerProps {
   onFKLookupConfigChange?: (config: FKLookupConfig) => void;
   onFKConfigColumnsRequest?: (columnName: string, fk: ForeignKeyInfo) => Promise<string[]>; // Request available columns for FK config
   onFKConfigReferencedTableFKsRequest?: (tableName: string) => Promise<ForeignKeyInfo[]>; // Request FKs for referenced table to detect nested FKs
+  onFKRecordRequest?: (fkColumn: string, fkValue: any, fk: ForeignKeyInfo) => Promise<Record<string, any> | null>; // Request full foreign record
+  onNavigateToTable?: (tableName: string, rowId: any, fk: ForeignKeyInfo) => void; // Navigate to foreign table and row
+  focusedRowId?: string | null; // ID of the row currently in focus
+  focusedColumnName?: string | null; // Name of the column currently in focus
 }
 
 export default function TableViewer({
@@ -129,6 +140,10 @@ export default function TableViewer({
   onFKLookupConfigChange,
   onFKConfigColumnsRequest,
   onFKConfigReferencedTableFKsRequest,
+  onFKRecordRequest,
+  onNavigateToTable,
+  focusedRowId = null,
+  focusedColumnName = null,
 }: TableViewerProps) {
   const [showHiddenColumnsModal, setShowHiddenColumnsModal] = useState(false);
   const [contextMenuColumn, setContextMenuColumn] = useState<string | null>(null);
@@ -152,7 +167,77 @@ export default function TableViewer({
   const [filterModalEquals, setFilterModalEquals] = useState<string>('');
   const [filterModalAllowNull, setFilterModalAllowNull] = useState<boolean>(true);
   const [filterModalAllowNonNull, setFilterModalAllowNonNull] = useState<boolean>(true);
+  const [showFKRecordModal, setShowFKRecordModal] = useState(false);
+  const [fkRecordModalData, setFKRecordModalData] = useState<{
+    fkColumn: string;
+    fkValue: any;
+    fk: ForeignKeyInfo;
+    record: Record<string, any> | null;
+    loading: boolean;
+  } | null>(null);
+  const [fkRecordModalTableFKs, setFKRecordModalTableFKs] = useState<ForeignKeyInfo[]>([]);
+  const [fkRecordModalNestedSelection, setFKRecordModalNestedSelection] = useState<{
+    columnName: string;
+    fk: ForeignKeyInfo;
+    columns: string[];
+    fks: ForeignKeyInfo[];
+    selectedColumns: Set<string>;
+    nestedLevels: Map<string, {
+      fk: ForeignKeyInfo;
+      columns: string[];
+      fks: ForeignKeyInfo[];
+      selectedColumns: Set<string>;
+    }>;
+  } | null>(null);
+  const [showFKHoverModal, setShowFKHoverModal] = useState(false);
+  const [fkHoverModalData, setFKHoverModalData] = useState<{
+    fkColumn: string;
+    fkValue: any;
+    fk: ForeignKeyInfo;
+    record: Record<string, any> | null;
+    loading: boolean;
+    position: { x: number; y: number };
+  } | null>(null);
+  const hoverTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const modalHoverTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const hoverModalExpandTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const cellRefsForHover = useRef<Map<string, { x: number; y: number; width: number; height: number }>>(new Map());
   const headerRefs = useRef<Map<string, any>>(new Map());
+  
+  // Helper function to show FK record modal
+  const showFKRecordModalForCell = useCallback(async (fkColumn: string, fkValue: any, fk: ForeignKeyInfo) => {
+    if (!onFKRecordRequest) return;
+    
+    setFKRecordModalData({
+      fkColumn,
+      fkValue,
+      fk,
+      record: null,
+      loading: true,
+    });
+    setShowFKRecordModal(true);
+    setFKRecordModalNestedSelection(null);
+    
+    // Fetch FKs for the referenced table to detect nested FKs
+    if (onFKConfigReferencedTableFKsRequest) {
+      try {
+        const tableFKs = await onFKConfigReferencedTableFKsRequest(fk.referencedTable);
+        setFKRecordModalTableFKs(tableFKs);
+      } catch (err) {
+        console.error('[FK Record] Error fetching table FKs:', err);
+        setFKRecordModalTableFKs([]);
+      }
+    }
+    
+    // Fetch the foreign record
+    try {
+      const record = await onFKRecordRequest(fkColumn, fkValue, fk);
+      setFKRecordModalData(prev => prev ? { ...prev, record, loading: false } : null);
+    } catch (err) {
+      console.error('[FK Record] Error fetching foreign record:', err);
+      setFKRecordModalData(prev => prev ? { ...prev, record: null, loading: false } : null);
+    }
+  }, [onFKRecordRequest, onFKConfigReferencedTableFKsRequest]);
   const columnRefs = useRef<Map<string, { header: any; cells: any[] }>>(new Map());
   
   // Column resizing state
@@ -295,6 +380,21 @@ export default function TableViewer({
   }, []);
 
   // Set up resize handlers for web
+  // Cleanup timeout refs on unmount
+  useEffect(() => {
+    return () => {
+      if (hoverTimeoutRef.current) {
+        clearTimeout(hoverTimeoutRef.current);
+      }
+      if (modalHoverTimeoutRef.current) {
+        clearTimeout(modalHoverTimeoutRef.current);
+      }
+      if (hoverModalExpandTimeoutRef.current) {
+        clearTimeout(hoverModalExpandTimeoutRef.current);
+      }
+    };
+  }, []);
+
   useEffect(() => {
     if (Platform.OS !== 'web' || typeof document === 'undefined') return;
 
@@ -997,10 +1097,16 @@ export default function TableViewer({
             </View>
             {/* Rows */}
             <ScrollView style={styles.tableBodyScroll}>
-              {paginatedRows.map((row, rowIndex) => (
-                <View key={row.id} style={styles.tableRow}>
+              {paginatedRows.map((row, rowIndex) => {
+                const isRowFocused = focusedRowId === row.id;
+                return (
+                <View key={row.id} style={[
+                  styles.tableRow,
+                  isRowFocused && styles.focusedRow,
+                ]}>
                   {getOrderedVisibleColumns.map((col, colIndex) => {
                     const value = row[col.name];
+                    const isColumnFocused = focusedColumnName === col.name;
                     const isNull = isValueNull(value);
                     const isDragging = draggedColumn === col.name;
                     const isDragOver = dragOverColumn === col.name;
@@ -1049,52 +1155,139 @@ export default function TableViewer({
                           { width: columnWidth },
                           isDragging && styles.draggingCell,
                           isDragOver && styles.dragOverCell,
+                          isColumnFocused && styles.focusedCell,
                         ]}
-                        onPress={() => {
-                          // Check if this is an FK column with lookup data
-                          const fkConfig = fkLookupConfig[col.name];
-                          if (fkConfig && !isNull && onFKCellClick) {
-                            onFKCellClick(col.name, value, fkConfig.fk);
+                        onPress={async () => {
+                          // Check if this is an FK column
+                          const fk = foreignKeys.find(fk => fk.columns.includes(col.name));
+                          if (fk && !isNull) {
+                            // Show modal with foreign record (on click)
+                            await showFKRecordModalForCell(col.name, value, fk);
                           } else {
                             handleCellClick(value, col.name);
                           }
                         }}
+                        {...(Platform.OS === 'web' ? {
+                          onMouseEnter: async (e: any) => {
+                            // Check if this is an FK column
+                            const fk = foreignKeys.find(fk => fk.columns.includes(col.name));
+                            if (fk && !isNull && onFKRecordRequest) {
+                              // Clear any existing timeout
+                              if (hoverTimeoutRef.current) {
+                                clearTimeout(hoverTimeoutRef.current);
+                              }
+                              
+                              // Get cell position for hover modal
+                              let cellPosition = { x: 0, y: 0 };
+                              const target = e?.target || e?.currentTarget;
+                              if (target) {
+                                const rect = (target as HTMLElement).getBoundingClientRect();
+                                if (rect) {
+                                  // Modal dimensions (approximate)
+                                  const modalWidth = 280;
+                                  const modalMaxHeight = 300;
+                                  const padding = 10;
+                                  const maxAdjustment = 100; // Maximum adjustment in pixels
+                                  
+                                  // Get viewport dimensions
+                                  const viewportWidth = window.innerWidth;
+                                  const viewportHeight = window.innerHeight;
+                                  
+                                  // Start with normal position (to the right of cell, top-aligned)
+                                  let preferredX = rect.right + padding;
+                                  let preferredY = rect.top;
+                                  
+                                  // Calculate how much it would overflow to the right
+                                  const rightOverflow = (preferredX + modalWidth) - viewportWidth;
+                                  if (rightOverflow > 0) {
+                                    // Try positioning to the left of the cell
+                                    const leftX = rect.left - modalWidth - padding;
+                                    if (leftX >= padding) {
+                                      // Left position fits, use it
+                                      preferredX = leftX;
+                                    } else {
+                                      // Left position also doesn't fit, adjust by overflow amount (capped)
+                                      const adjustment = Math.min(rightOverflow + padding, maxAdjustment);
+                                      preferredX = preferredX - adjustment;
+                                    }
+                                  }
+                                  
+                                  // Calculate how much it would overflow at the bottom
+                                  const bottomOverflow = (preferredY + modalMaxHeight) - viewportHeight;
+                                  if (bottomOverflow > 0) {
+                                    // Adjust up by the overflow amount (capped)
+                                    const adjustment = Math.min(bottomOverflow + padding, maxAdjustment);
+                                    preferredY = preferredY - adjustment;
+                                  }
+                                  
+                                  // Calculate how much it would overflow at the top
+                                  const topOverflow = padding - preferredY;
+                                  if (topOverflow > 0) {
+                                    // Adjust down by the overflow amount (capped)
+                                    const adjustment = Math.min(topOverflow, maxAdjustment);
+                                    preferredY = preferredY + adjustment;
+                                  }
+                                  
+                                  cellPosition = { x: preferredX, y: preferredY };
+                                }
+                              }
+                              
+                              // Show hover modal after a short delay
+                              hoverTimeoutRef.current = setTimeout(async () => {
+                                // Fetch record (will use cache if available)
+                                let record = null;
+                                let loading = true;
+                                
+                                if (onFKRecordRequest) {
+                                  record = await onFKRecordRequest(col.name, value, fk);
+                                  loading = false;
+                                }
+                                
+                                setFKHoverModalData({
+                                  fkColumn: col.name,
+                                  fkValue: value,
+                                  fk: fk,
+                                  record,
+                                  loading,
+                                  position: cellPosition,
+                                });
+                                setShowFKHoverModal(true);
+                              }, 300);
+                            }
+                          },
+                          onMouseLeave: () => {
+                            // Clear hover timeout if mouse leaves before delay
+                            if (hoverTimeoutRef.current) {
+                              clearTimeout(hoverTimeoutRef.current);
+                              hoverTimeoutRef.current = null;
+                            }
+                            // Hide hover modal after a short delay
+                            if (modalHoverTimeoutRef.current) {
+                              clearTimeout(modalHoverTimeoutRef.current);
+                            }
+                            modalHoverTimeoutRef.current = setTimeout(() => {
+                              setShowFKHoverModal(false);
+                            }, 200);
+                          },
+                        } : {})}
                         activeOpacity={0.7}
                       >
                         {(() => {
-                          // Check if this column is a foreign key with lookup data
-                          const fkConfig = fkLookupConfig[col.name];
-                          if (fkConfig && !isNull) {
-                            const lookupData = fkLookupData.get(col.name);
-                            const lookupValue = lookupData?.get(value);
-                            
-                            if (lookupValue !== undefined) {
-                              // Show FK lookup value as clickable link
-                              return (
-                                <Text
-                                  style={[
-                                    styles.tableCellText,
-                                    styles.fkLinkText,
-                                  ]}
-                                  numberOfLines={1}
-                                >
-                                  {formatCellValue(lookupValue, col.name)} →
-                                </Text>
-                              );
-                            } else {
-                              // FK value exists but lookup not loaded yet - show loading or fallback
-                              return (
-                                <Text
-                                  style={[
-                                    styles.tableCellText,
-                                    isNull && styles.nullValueText,
-                                  ]}
-                                  numberOfLines={1}
-                                >
-                                  {formatCellValue(value, col.name)} (loading...)
-                                </Text>
-                              );
-                            }
+                          // Check if this column is a foreign key
+                          const fk = foreignKeys.find(fk => fk.columns.includes(col.name));
+                          if (fk && !isNull) {
+                            // Show FK value as clickable link
+                            return (
+                              <Text
+                                style={[
+                                  styles.tableCellText,
+                                  styles.fkLinkText,
+                                ]}
+                                numberOfLines={1}
+                              >
+                                {formatCellValue(value, col.name)} →
+                              </Text>
+                            );
                           }
                           
                           // Regular cell display
@@ -1118,7 +1311,8 @@ export default function TableViewer({
                     <View style={[styles.tableCell, styles.hiddenColumnsCell]} />
                   )}
                 </View>
-              ))}
+                );
+              })}
               {paginatedRows.length === 0 && (
                 <View style={styles.emptyRow}>
                   <Text style={styles.emptyText}>No rows found</Text>
@@ -1231,7 +1425,12 @@ export default function TableViewer({
                   }}
                 >
                   <Text style={styles.contextMenuText}>
-                    Configure FK Lookup ({fkLookupConfig[contextMenuColumn].lookupColumn})
+                    Add FK Lookup Column
+                    {fkLookupConfig[contextMenuColumn].lookupColumns && fkLookupConfig[contextMenuColumn].lookupColumns.length > 0 && (
+                      <Text style={styles.contextMenuSubtext}>
+                        {' '}({fkLookupConfig[contextMenuColumn].lookupColumns.length} configured)
+                      </Text>
+                    )}
                   </Text>
                 </TouchableOpacity>
               )}
@@ -1621,143 +1820,854 @@ export default function TableViewer({
                 </View>
                 <View style={styles.fkConfigModalBody}>
                   <Text style={styles.fkConfigModalLabel}>
-                    Select lookup column (click FK columns to expand):
+                    Add or remove lookup columns:
                   </Text>
-                  <ScrollView 
-                    horizontal 
-                    style={styles.fkConfigCascadingContainer}
-                    contentContainerStyle={styles.fkConfigCascadingContent}
-                  >
-                    {fkConfigSelectionPath.map((level, levelIndex) => (
-                      <View key={levelIndex} style={styles.fkConfigLevelPanel}>
-                        <Text style={styles.fkConfigLevelTitle}>
-                          {level.tableName}
-                        </Text>
-                        <ScrollView style={styles.fkConfigLevelColumnsList}>
-                          {level.columns.map((colName) => {
-                            const isSelected = level.selectedColumn === colName;
-                            const isFKColumn = level.fks.some(fk => fk.columns.includes(colName));
-                            const columnFK = isFKColumn ? level.fks.find(fk => fk.columns.includes(colName)) : null;
-                            
-                            return (
-                              <TouchableOpacity
-                                key={colName}
+                  <ScrollView style={styles.fkConfigColumnsList}>
+                    {fkConfigSelectionPath.length > 0 && fkConfigSelectionPath[0].columns.map((colName) => {
+                      // Check if this is the FK column itself (the one that matches the FK's referenced columns)
+                      const fkForColumn = foreignKeys.find(fk => fk.columns.includes(fkConfigColumn));
+                      const isFKColumnItself = fkForColumn && fkForColumn.referencedColumns.includes(colName);
+                      
+                      // Check if this column is already a lookup column
+                      const existingConfig = fkLookupConfig[fkConfigColumn] || { lookupColumns: [] };
+                      const existingLookupColumns = existingConfig.lookupColumns || [];
+                      const isLookupColumn = existingLookupColumns.some(lc => 
+                        lc.lookupColumn === colName && !lc.nestedFK
+                      );
+                      
+                      // Check if this column is an FK (for nested lookups)
+                      const isFKColumn = fkConfigSelectionPath[0].fks.some(fk => fk.columns.includes(colName));
+                      const columnFK = isFKColumn ? fkConfigSelectionPath[0].fks.find(fk => fk.columns.includes(colName)) : null;
+                      
+                      const handleToggleLookup = () => {
+                        const newConfig = { ...fkLookupConfig };
+                        const existingConfig = newConfig[fkConfigColumn] || { lookupColumns: [] };
+                        const existingLookupColumns = existingConfig.lookupColumns || [];
+                        
+                        if (isLookupColumn) {
+                          // Remove this lookup column
+                          newConfig[fkConfigColumn] = {
+                            lookupColumns: existingLookupColumns.filter(lc => 
+                              !(lc.lookupColumn === colName && !lc.nestedFK)
+                            ),
+                          };
+                        } else {
+                          // Add this lookup column
+                          if (!fkForColumn) {
+                            console.error('[FK Config Modal] No FK found for column:', fkConfigColumn);
+                            return;
+                          }
+                          
+                          const newLookupColumn: FKLookupColumn = {
+                            fk: fkForColumn,
+                            lookupColumn: colName,
+                          };
+                          
+                          newConfig[fkConfigColumn] = {
+                            lookupColumns: [...existingLookupColumns, newLookupColumn],
+                          };
+                        }
+                        
+                        onFKLookupConfigChange(newConfig);
+                      };
+                      
+                      return (
+                        <View
+                          key={colName}
+                          style={[
+                            styles.fkConfigColumnItem,
+                            isFKColumnItself && styles.fkConfigColumnItemFK,
+                            isLookupColumn && styles.fkConfigColumnItemActive,
+                          ]}
+                        >
+                          <View style={styles.fkConfigColumnItemContent}>
+                            <View style={styles.fkConfigColumnItemLeft}>
+                              <Text
                                 style={[
-                                  styles.fkConfigColumnItem,
-                                  isSelected && styles.fkConfigColumnItemSelected,
+                                  styles.fkConfigColumnItemText,
+                                  isFKColumnItself && styles.fkConfigColumnItemTextFK,
+                                  isLookupColumn && styles.fkConfigColumnItemTextActive,
                                 ]}
-                                onPress={async () => {
-                                  if (isFKColumn && columnFK && onFKConfigColumnsRequest && onFKConfigReferencedTableFKsRequest) {
-                                    // This column is an FK - expand to show its referenced table
-                                    try {
-                                      const nestedColumns = await onFKConfigColumnsRequest(colName, columnFK);
-                                      const nestedFKs = await onFKConfigReferencedTableFKsRequest(columnFK.referencedTable);
-                                      
-                                      // Update current level selection
-                                      const updatedPath = [...fkConfigSelectionPath];
-                                      updatedPath[levelIndex] = {
-                                        ...level,
-                                        selectedColumn: colName,
-                                        selectedFK: columnFK,
-                                      };
-                                      
-                                      // Add new level
-                                      updatedPath.push({
-                                        tableName: columnFK.referencedTable,
-                                        columns: nestedColumns,
-                                        fks: nestedFKs,
-                                      });
-                                      
-                                      setFKConfigSelectionPath(updatedPath);
-                                    } catch (err) {
-                                      console.error('[FK Config] Error loading nested FK columns:', err);
-                                    }
-                                  } else {
-                                    // This is a regular column - apply the config
-                                    const newConfig = { ...fkLookupConfig };
-                                    
-                                    // Build nested FK config from the selection path
-                                    // The path represents: level0 -> level1 -> level2 -> ... -> final column
-                                    // We need to build: baseLookupColumn with nestedFK chain
-                                    
-                                    // Get the base lookup column (from first level)
-                                    const baseLevel = fkConfigSelectionPath[0];
-                                    const baseLookupColumn = baseLevel?.selectedColumn || colName;
-                                    
-                                    // Build nested FK config recursively from the path
-                                    // The path structure:
-                                    // - Level 0: base table (presidents), selectedColumn: person_id (FK), selectedFK: FK to people
-                                    // - Level 1: nested table (people), selectedColumn: last_name
-                                    // We need to build: { fk: FK from person_id to people, lookupColumn: last_name }
-                                    
-                                    // Check if level 0's selected column is an FK (this creates the first nested level)
-                                    const baseLevelFK = baseLevel?.fks?.find(fk => 
-                                      fk.columns.includes(baseLookupColumn)
-                                    );
-                                    
-                                    // If we have a nested FK chain (base column is FK and we have more levels)
-                                    let nestedFKConfig: FKLookupConfig[string]['nestedFK'] | undefined = undefined;
-                                    if (baseLevelFK && fkConfigSelectionPath.length > 1) {
-                                      // Build nested FK config
-                                      // The nested FK uses the FK from level 0, and the lookup column from level 1
-                                      nestedFKConfig = {
-                                        fk: {
-                                          columns: baseLevelFK.columns,
-                                          referencedTable: baseLevelFK.referencedTable,
-                                          referencedColumns: baseLevelFK.referencedColumns,
-                                        },
-                                        lookupColumn: levelIndex === 1 ? colName : (fkConfigSelectionPath[1]?.selectedColumn || colName),
-                                      };
-                                    }
-                                    
-                                    console.log('[FK Config Modal] Building config:', {
-                                      fkConfigColumn,
-                                      baseLookupColumn,
-                                      baseLevelFK: baseLevelFK ? {
-                                        columns: baseLevelFK.columns,
-                                        referencedTable: baseLevelFK.referencedTable,
-                                      } : null,
-                                      pathLength: fkConfigSelectionPath.length,
-                                      hasNestedFK: !!nestedFKConfig,
-                                      nestedFKConfig,
-                                    });
-                                    
-                                    newConfig[fkConfigColumn] = {
-                                      ...newConfig[fkConfigColumn],
-                                      lookupColumn: baseLookupColumn,
-                                      ...(nestedFKConfig && { nestedFK: nestedFKConfig }),
-                                    };
-                                    
-                                    onFKLookupConfigChange(newConfig);
-                                    setShowFKConfigModal(false);
-                                    setFKConfigSelectionPath([]);
-                                  }
-                                }}
                               >
-                                <View style={styles.fkConfigColumnItemContent}>
-                                  <Text
-                                    style={[
-                                      styles.fkConfigColumnItemText,
-                                      isSelected && styles.fkConfigColumnItemTextSelected,
-                                    ]}
-                                  >
-                                    {colName}
-                                    {isSelected && ' ✓'}
-                                  </Text>
-                                  {isFKColumn && (
-                                    <Text style={styles.fkConfigColumnFKIndicator}>
-                                      → FK
-                                    </Text>
-                                  )}
-                                </View>
+                                {colName}
+                                {isFKColumnItself && ' (FK Column)'}
+                              </Text>
+                              {isFKColumn && !isFKColumnItself && (
+                                <Text style={styles.fkConfigColumnFKIndicator}>
+                                  → FK
+                                </Text>
+                              )}
+                            </View>
+                            {!isFKColumnItself && (
+                              <TouchableOpacity
+                                style={[
+                                  styles.fkConfigToggleButton,
+                                  isLookupColumn && styles.fkConfigToggleButtonActive,
+                                ]}
+                                onPress={handleToggleLookup}
+                              >
+                                <Text style={[
+                                  styles.fkConfigToggleButtonText,
+                                  isLookupColumn && styles.fkConfigToggleButtonTextActive,
+                                ]}>
+                                  {isLookupColumn ? 'Remove' : 'Add'}
+                                </Text>
                               </TouchableOpacity>
-                            );
-                          })}
-                        </ScrollView>
-                      </View>
-                    ))}
+                            )}
+                          </View>
+                        </View>
+                      );
+                    })}
                   </ScrollView>
                 </View>
+              </View>
+            </TouchableOpacity>
+          </TouchableOpacity>
+        </Modal>
+      )}
+
+      {/* FK Hover Modal - concise preview on hover */}
+      {Platform.OS === 'web' && showFKHoverModal && fkHoverModalData && (
+        <TouchableOpacity
+          activeOpacity={1}
+          style={[
+            styles.fkHoverModal,
+            {
+              position: 'fixed',
+              left: fkHoverModalData.position.x,
+              top: fkHoverModalData.position.y,
+              zIndex: 10000,
+            },
+          ]}
+          onPress={() => {
+            // Clear expand timer
+            if (hoverModalExpandTimeoutRef.current) {
+              clearTimeout(hoverModalExpandTimeoutRef.current);
+              hoverModalExpandTimeoutRef.current = null;
+            }
+            // On click, open the full modal
+            setShowFKHoverModal(false);
+            setFKRecordModalData({
+              fkColumn: fkHoverModalData.fkColumn,
+              fkValue: fkHoverModalData.fkValue,
+              fk: fkHoverModalData.fk,
+              record: fkHoverModalData.record,
+              loading: fkHoverModalData.loading,
+            });
+            setShowFKRecordModal(true);
+          }}
+          {...(Platform.OS === 'web' ? {
+            onMouseEnter: () => {
+              // Keep modal open when mouse enters
+              if (modalHoverTimeoutRef.current) {
+                clearTimeout(modalHoverTimeoutRef.current);
+                modalHoverTimeoutRef.current = null;
+              }
+              
+              // Start timer to expand to full modal after 1 second
+              if (hoverModalExpandTimeoutRef.current) {
+                clearTimeout(hoverModalExpandTimeoutRef.current);
+              }
+              hoverModalExpandTimeoutRef.current = setTimeout(() => {
+                // Expand to full modal
+                setShowFKHoverModal(false);
+                setFKRecordModalData({
+                  fkColumn: fkHoverModalData.fkColumn,
+                  fkValue: fkHoverModalData.fkValue,
+                  fk: fkHoverModalData.fk,
+                  record: fkHoverModalData.record,
+                  loading: fkHoverModalData.loading,
+                });
+                setShowFKRecordModal(true);
+              }, 1000);
+            },
+            onMouseLeave: () => {
+              // Clear expand timer
+              if (hoverModalExpandTimeoutRef.current) {
+                clearTimeout(hoverModalExpandTimeoutRef.current);
+                hoverModalExpandTimeoutRef.current = null;
+              }
+              
+              // Hide modal when mouse leaves
+              if (modalHoverTimeoutRef.current) {
+                clearTimeout(modalHoverTimeoutRef.current);
+              }
+              modalHoverTimeoutRef.current = setTimeout(() => {
+                setShowFKHoverModal(false);
+              }, 200);
+            },
+          } : {})}
+        >
+              {fkHoverModalData.loading ? (
+            <Text style={styles.fkHoverModalText}>Loading...</Text>
+          ) : fkHoverModalData.record ? (
+            <ScrollView style={styles.fkHoverModalContent} nestedScrollEnabled>
+              {Object.entries(fkHoverModalData.record).slice(0, 10).map(([key, value]) => (
+                <View key={key} style={styles.fkHoverModalRow}>
+                  <Text style={styles.fkHoverModalLabel}>{key}:</Text>
+                  <Text style={styles.fkHoverModalValue} numberOfLines={1}>
+                    {value === null || value === undefined ? '?' : String(value)}
+                  </Text>
+                </View>
+              ))}
+              {Object.keys(fkHoverModalData.record).length > 10 && (
+                <Text style={styles.fkHoverModalMore}>
+                  +{Object.keys(fkHoverModalData.record).length - 10} more
+                </Text>
+              )}
+              {onNavigateToTable && (
+                <TouchableOpacity
+                  style={styles.fkHoverModalLink}
+                  onPress={(e) => {
+                    e.stopPropagation();
+                    const pkColumn = fkHoverModalData.fk.referencedColumns[0];
+                    const pkValue = fkHoverModalData.record![pkColumn];
+                    onNavigateToTable(fkHoverModalData.fk.referencedTable, pkValue, fkHoverModalData.fk);
+                    setShowFKHoverModal(false);
+                  }}
+                >
+                  <Text style={styles.fkHoverModalLinkText}>View Record →</Text>
+                </TouchableOpacity>
+              )}
+            </ScrollView>
+          ) : (
+            <Text style={styles.fkHoverModalText}>Record not found</Text>
+          )}
+        </TouchableOpacity>
+      )}
+
+      {/* FK Record Modal - shows the foreign record (full modal on click) */}
+      {showFKRecordModal && fkRecordModalData && (
+        <Modal
+          visible={showFKRecordModal}
+          transparent={true}
+          animationType="fade"
+          onRequestClose={() => setShowFKRecordModal(false)}
+        >
+          <TouchableOpacity
+            style={styles.modalOverlay}
+            activeOpacity={1}
+            onPress={() => setShowFKRecordModal(false)}
+            {...(Platform.OS === 'web' ? {
+              onMouseEnter: () => {
+                // Clear hide timeout when mouse enters modal
+                if (modalHoverTimeoutRef.current) {
+                  clearTimeout(modalHoverTimeoutRef.current);
+                  modalHoverTimeoutRef.current = null;
+                }
+              },
+              onMouseLeave: () => {
+                // Hide modal after a short delay when mouse leaves
+                modalHoverTimeoutRef.current = setTimeout(() => {
+                  setShowFKRecordModal(false);
+                }, 200);
+              },
+            } : {})}
+          >
+            <TouchableOpacity
+              activeOpacity={1}
+              onPress={(e) => e.stopPropagation()}
+              style={styles.fkRecordModalContent}
+              {...(Platform.OS === 'web' ? {
+                onMouseEnter: () => {
+                  // Clear hide timeout when mouse enters modal content
+                  if (modalHoverTimeoutRef.current) {
+                    clearTimeout(modalHoverTimeoutRef.current);
+                    modalHoverTimeoutRef.current = null;
+                  }
+                },
+                onMouseLeave: () => {
+                  // Hide modal after a short delay when mouse leaves modal content
+                  modalHoverTimeoutRef.current = setTimeout(() => {
+                    setShowFKRecordModal(false);
+                  }, 200);
+                },
+              } : {})}
+            >
+              <View style={styles.fkRecordModalHeader}>
+                <Text style={styles.fkRecordModalTitle}>
+                  Foreign Record: {fkRecordModalData.fk.referencedTable}
+                </Text>
+                <TouchableOpacity
+                  onPress={() => setShowFKRecordModal(false)}
+                  style={styles.modalCloseButton}
+                >
+                  <Text style={styles.modalCloseButtonText}>×</Text>
+                </TouchableOpacity>
+              </View>
+              
+              {fkRecordModalData.loading ? (
+                <View style={styles.fkRecordModalBody}>
+                  <Text style={styles.loadingText}>Loading record...</Text>
+                </View>
+              ) : fkRecordModalData.record ? (
+                <ScrollView style={styles.fkRecordModalBody}>
+                  {Object.entries(fkRecordModalData.record).map(([key, value]) => {
+                    // Check if this is the FK column itself (the one that matches the FK's referenced columns)
+                    const isFKColumnItself = fkRecordModalData.fk.referencedColumns.includes(key);
+                    
+                    // Check if this column is itself an FK to another table
+                    const columnFK = fkRecordModalTableFKs.find(fk => fk.columns.includes(key));
+                    const isNestedFKColumn = !!columnFK;
+                    
+                    // Check if this column is already a lookup column (direct or nested)
+                    const existingConfig = fkLookupConfig[fkRecordModalData.fkColumn] || { lookupColumns: [] };
+                    const existingLookupColumns = existingConfig.lookupColumns || [];
+                    const isLookupColumn = existingLookupColumns.some(lc => 
+                      lc.lookupColumn === key && !lc.nestedFK
+                    );
+                    // Check for nested lookup columns that use this column as the intermediate FK
+                    const isNestedLookupColumn = existingLookupColumns.some(lc => 
+                      lc.lookupColumn === key && lc.nestedFK
+                    );
+                    
+                    const handleToggleLookup = async () => {
+                      if (!onFKLookupConfigChange) return;
+                      
+                      // If this is an FK column, show nested selection
+                      if (isNestedFKColumn && columnFK && onFKConfigColumnsRequest) {
+                        // If already has nested lookup, remove it
+                        if (isNestedLookupColumn) {
+                          const newConfig = { ...fkLookupConfig };
+                          const existingConfig = newConfig[fkRecordModalData.fkColumn] || { lookupColumns: [] };
+                          const existingLookupColumns = existingConfig.lookupColumns || [];
+                          newConfig[fkRecordModalData.fkColumn] = {
+                            lookupColumns: existingLookupColumns.filter(lc => 
+                              !(lc.lookupColumn === key && lc.nestedFK)
+                            ),
+                          };
+                          onFKLookupConfigChange(newConfig);
+                          return;
+                        }
+                        
+                        // Otherwise, show nested selection modal
+                        console.log('[FK Record] Opening nested selection for FK column:', key, columnFK);
+                        try {
+                          const nestedColumns = await onFKConfigColumnsRequest(key, columnFK);
+                          // Get FKs for the nested table to support recursive chaining
+                          let nestedFKs: ForeignKeyInfo[] = [];
+                          if (onFKConfigReferencedTableFKsRequest) {
+                            try {
+                              nestedFKs = await onFKConfigReferencedTableFKsRequest(columnFK.referencedTable);
+                            } catch (err) {
+                              console.error('[FK Record] Error loading nested table FKs:', err);
+                            }
+                          }
+                          console.log('[FK Record] Loaded nested columns:', nestedColumns, 'FKs:', nestedFKs);
+                          setFKRecordModalNestedSelection({
+                            columnName: key,
+                            fk: columnFK,
+                            columns: nestedColumns,
+                            fks: nestedFKs,
+                            selectedColumns: new Set(),
+                            nestedLevels: new Map(),
+                          });
+                        } catch (err) {
+                          console.error('[FK Record] Error loading nested columns:', err);
+                        }
+                        return;
+                      }
+                      
+                      // Regular column - add/remove directly
+                      const newConfig = { ...fkLookupConfig };
+                      const existingConfig = newConfig[fkRecordModalData.fkColumn] || { lookupColumns: [] };
+                      const existingLookupColumns = existingConfig.lookupColumns || [];
+                      
+                      if (isLookupColumn) {
+                        // Remove this lookup column
+                        newConfig[fkRecordModalData.fkColumn] = {
+                          lookupColumns: existingLookupColumns.filter(lc => 
+                            !(lc.lookupColumn === key && !lc.nestedFK)
+                          ),
+                        };
+                      } else {
+                        // Add this lookup column
+                        const newLookupColumn: FKLookupColumn = {
+                          fk: fkRecordModalData.fk,
+                          lookupColumn: key,
+                        };
+                        
+                        newConfig[fkRecordModalData.fkColumn] = {
+                          lookupColumns: [...existingLookupColumns, newLookupColumn],
+                        };
+                      }
+                      
+                      onFKLookupConfigChange(newConfig);
+                    };
+                    
+                    return (
+                      <View 
+                        key={key} 
+                        style={[
+                          styles.fkRecordField,
+                          isFKColumnItself && styles.fkRecordFieldFK,
+                          (isLookupColumn || isNestedLookupColumn) && styles.fkRecordFieldActive,
+                        ]}
+                      >
+                        {!isFKColumnItself && onFKLookupConfigChange && (
+                          <TouchableOpacity
+                            style={[
+                              styles.fkRecordToggleIconButton,
+                              (isLookupColumn || isNestedLookupColumn) ? styles.fkRecordToggleIconButtonRemove : styles.fkRecordToggleIconButtonAdd,
+                            ]}
+                            onPress={handleToggleLookup}
+                          >
+                            <Text style={styles.fkRecordToggleIconButtonText}>
+                              {(isLookupColumn || isNestedLookupColumn) ? '−' : '+'}
+                            </Text>
+                          </TouchableOpacity>
+                        )}
+                        {isFKColumnItself && <View style={styles.fkRecordToggleIconButtonPlaceholder} />}
+                        <Text style={[
+                          styles.fkRecordFieldLabel,
+                          isFKColumnItself && styles.fkRecordFieldLabelFK,
+                          (isLookupColumn || isNestedLookupColumn) && styles.fkRecordFieldLabelActive,
+                        ]}>
+                          {key}:
+                          {isNestedFKColumn && ' → FK'}
+                          {isNestedLookupColumn && ' (chained)'}
+                        </Text>
+                        <Text style={[
+                          styles.fkRecordFieldValue,
+                          isFKColumnItself && styles.fkRecordFieldValueFK,
+                        ]}>
+                          {value === null || value === undefined ? '?' : String(value)}
+                        </Text>
+                      </View>
+                    );
+                  })}
+                </ScrollView>
+              ) : (
+                <View style={styles.fkRecordModalBody}>
+                  <Text style={styles.errorText}>Record not found</Text>
+                </View>
+              )}
+              
+              {fkRecordModalData.record && onNavigateToTable && (
+                <View style={styles.fkRecordModalFooter}>
+                  <TouchableOpacity
+                    style={styles.fkRecordViewLink}
+                    onPress={() => {
+                      // Find the primary key column from the FK referenced columns
+                      const pkColumn = fkRecordModalData.fk.referencedColumns[0];
+                      const pkValue = fkRecordModalData.record![pkColumn];
+                      onNavigateToTable(fkRecordModalData.fk.referencedTable, pkValue, fkRecordModalData.fk);
+                      setShowFKRecordModal(false);
+                    }}
+                  >
+                    <Text style={styles.fkRecordViewLinkText}>
+                      View Record →
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+            </TouchableOpacity>
+          </TouchableOpacity>
+        </Modal>
+      )}
+
+      {/* Nested FK Column Selection Modal */}
+      {fkRecordModalNestedSelection && fkRecordModalData && (
+        <Modal
+          visible={!!fkRecordModalNestedSelection}
+          transparent={true}
+          animationType="fade"
+          onRequestClose={() => setFKRecordModalNestedSelection(null)}
+        >
+          <TouchableOpacity
+            style={styles.modalOverlay}
+            activeOpacity={1}
+            onPress={() => setFKRecordModalNestedSelection(null)}
+          >
+            <TouchableOpacity
+              activeOpacity={1}
+              onPress={(e) => e.stopPropagation()}
+              style={styles.fkRecordModalContent}
+            >
+              <View style={styles.fkRecordModalHeader}>
+                <Text style={styles.fkRecordModalTitle}>
+                  Select column from {fkRecordModalNestedSelection.fk.referencedTable}
+                </Text>
+                <TouchableOpacity
+                  onPress={() => setFKRecordModalNestedSelection(null)}
+                  style={styles.modalCloseButton}
+                >
+                  <Text style={styles.modalCloseButtonText}>×</Text>
+                </TouchableOpacity>
+              </View>
+              <ScrollView 
+                horizontal 
+                style={styles.fkConfigCascadingContainer}
+                contentContainerStyle={styles.fkConfigCascadingContent}
+              >
+                {/* Render current level */}
+                <View style={styles.fkConfigLevelPanel}>
+                  <Text style={styles.fkConfigLevelTitle}>
+                    {fkRecordModalNestedSelection.fk.referencedTable}
+                  </Text>
+                  <ScrollView style={styles.fkConfigLevelColumnsList}>
+                    {fkRecordModalNestedSelection.columns.map((colName) => {
+                      const isSelected = fkRecordModalNestedSelection.selectedColumns.has(colName);
+                      const isFKColumn = fkRecordModalNestedSelection.fks.some(fk => fk.columns.includes(colName));
+                      const columnFK = isFKColumn ? fkRecordModalNestedSelection.fks.find(fk => fk.columns.includes(colName)) : null;
+                      const hasNestedLevel = fkRecordModalNestedSelection.nestedLevels.has(colName);
+                      const nestedLevel = hasNestedLevel ? fkRecordModalNestedSelection.nestedLevels.get(colName)! : null;
+                      
+                      const handleToggleColumn = async () => {
+                        const newSelected = new Set(fkRecordModalNestedSelection.selectedColumns);
+                        if (isSelected) {
+                          newSelected.delete(colName);
+                          // Remove nested level if it exists
+                          const newNestedLevels = new Map(fkRecordModalNestedSelection.nestedLevels);
+                          newNestedLevels.delete(colName);
+                          setFKRecordModalNestedSelection({
+                            ...fkRecordModalNestedSelection,
+                            selectedColumns: newSelected,
+                            nestedLevels: newNestedLevels,
+                          });
+                        } else {
+                          newSelected.add(colName);
+                          setFKRecordModalNestedSelection({
+                            ...fkRecordModalNestedSelection,
+                            selectedColumns: newSelected,
+                          });
+                        }
+                      };
+                      
+                      const handleExpandFK = async () => {
+                        if (!columnFK || !onFKConfigColumnsRequest || !onFKConfigReferencedTableFKsRequest) return;
+                        
+                        try {
+                          const nestedColumns = await onFKConfigColumnsRequest(colName, columnFK);
+                          const nestedFKs = await onFKConfigReferencedTableFKsRequest(columnFK.referencedTable);
+                          
+                          const newNestedLevels = new Map(fkRecordModalNestedSelection.nestedLevels);
+                          newNestedLevels.set(colName, {
+                            fk: columnFK,
+                            columns: nestedColumns,
+                            fks: nestedFKs,
+                            selectedColumns: new Set(),
+                          });
+                          
+                          setFKRecordModalNestedSelection({
+                            ...fkRecordModalNestedSelection,
+                            nestedLevels: newNestedLevels,
+                          });
+                        } catch (err) {
+                          console.error('[FK Record] Error loading nested level:', err);
+                        }
+                      };
+                      
+                      return (
+                        <View key={colName} style={styles.fkConfigColumnItem}>
+                          <View style={styles.fkConfigColumnItemContent}>
+                            <TouchableOpacity
+                              style={styles.fkConfigCheckbox}
+                              onPress={handleToggleColumn}
+                            >
+                              <Text style={styles.fkConfigCheckboxText}>
+                                {isSelected ? '✓' : '○'}
+                              </Text>
+                            </TouchableOpacity>
+                            <Text style={[
+                              styles.fkConfigColumnItemText,
+                              isSelected && styles.fkConfigColumnItemTextSelected,
+                            ]}>
+                              {colName}
+                            </Text>
+                            {isFKColumn && (
+                              <TouchableOpacity
+                                style={styles.fkConfigExpandButton}
+                                onPress={handleExpandFK}
+                              >
+                                <Text style={styles.fkConfigExpandButtonText}>
+                                  {hasNestedLevel ? '▼' : '▶'}
+                                </Text>
+                              </TouchableOpacity>
+                            )}
+                          </View>
+                        </View>
+                      );
+                    })}
+                  </ScrollView>
+                </View>
+                
+                {/* Render nested levels recursively */}
+                {Array.from(fkRecordModalNestedSelection.nestedLevels.entries()).map(([parentCol, level]) => {
+                  // Check if this level has nested levels (for recursive expansion)
+                  const levelNestedLevels = new Map<string, {
+                    fk: ForeignKeyInfo;
+                    columns: string[];
+                    fks: ForeignKeyInfo[];
+                    selectedColumns: Set<string>;
+                  }>();
+                  
+                  // Find nested levels that belong to this level
+                  for (const [key, nestedLevel] of fkRecordModalNestedSelection.nestedLevels.entries()) {
+                    // Check if this nested level's FK columns match any column in the current level
+                    if (level.columns.some(col => nestedLevel.fk.columns.includes(col))) {
+                      levelNestedLevels.set(key, nestedLevel);
+                    }
+                  }
+                  
+                  return (
+                    <View key={parentCol} style={styles.fkConfigLevelPanel}>
+                      <Text style={styles.fkConfigLevelTitle}>
+                        {level.fk.referencedTable}
+                      </Text>
+                      <ScrollView style={styles.fkConfigLevelColumnsList}>
+                        {level.columns.map((colName) => {
+                          const isSelected = level.selectedColumns.has(colName);
+                          const isFKColumn = level.fks.some(fk => fk.columns.includes(colName));
+                          const columnFK = isFKColumn ? level.fks.find(fk => fk.columns.includes(colName)) : null;
+                          const hasNestedLevel = levelNestedLevels.has(colName);
+                          const nestedLevel = hasNestedLevel ? levelNestedLevels.get(colName)! : null;
+                          
+                          const handleToggleColumn = () => {
+                            const newSelected = new Set(level.selectedColumns);
+                            if (isSelected) {
+                              newSelected.delete(colName);
+                              // Remove nested level if it exists
+                              const newNestedLevels = new Map(fkRecordModalNestedSelection.nestedLevels);
+                              newNestedLevels.delete(colName);
+                              setFKRecordModalNestedSelection({
+                                ...fkRecordModalNestedSelection,
+                                nestedLevels: newNestedLevels,
+                              });
+                            } else {
+                              newSelected.add(colName);
+                              setFKRecordModalNestedSelection({
+                                ...fkRecordModalNestedSelection,
+                                nestedLevels: new Map(fkRecordModalNestedSelection.nestedLevels),
+                              });
+                            }
+                            
+                            const newNestedLevels = new Map(fkRecordModalNestedSelection.nestedLevels);
+                            newNestedLevels.set(parentCol, {
+                              ...level,
+                              selectedColumns: newSelected,
+                            });
+                            
+                            setFKRecordModalNestedSelection({
+                              ...fkRecordModalNestedSelection,
+                              nestedLevels: newNestedLevels,
+                            });
+                          };
+                          
+                          const handleExpandFK = async () => {
+                            if (!columnFK || !onFKConfigColumnsRequest || !onFKConfigReferencedTableFKsRequest) return;
+                            
+                            try {
+                              const nestedColumns = await onFKConfigColumnsRequest(colName, columnFK);
+                              const nestedFKs = await onFKConfigReferencedTableFKsRequest(columnFK.referencedTable);
+                              
+                              const newNestedLevels = new Map(fkRecordModalNestedSelection.nestedLevels);
+                              newNestedLevels.set(colName, {
+                                fk: columnFK,
+                                columns: nestedColumns,
+                                fks: nestedFKs,
+                                selectedColumns: new Set(),
+                              });
+                              
+                              setFKRecordModalNestedSelection({
+                                ...fkRecordModalNestedSelection,
+                                nestedLevels: newNestedLevels,
+                              });
+                            } catch (err) {
+                              console.error('[FK Record] Error loading nested level:', err);
+                            }
+                          };
+                          
+                          return (
+                            <View key={colName} style={styles.fkConfigColumnItem}>
+                              <View style={styles.fkConfigColumnItemContent}>
+                                <TouchableOpacity
+                                  style={styles.fkConfigCheckbox}
+                                  onPress={handleToggleColumn}
+                                >
+                                  <Text style={styles.fkConfigCheckboxText}>
+                                    {isSelected ? '✓' : '○'}
+                                  </Text>
+                                </TouchableOpacity>
+                                <Text style={[
+                                  styles.fkConfigColumnItemText,
+                                  isSelected && styles.fkConfigColumnItemTextSelected,
+                                ]}>
+                                  {colName}
+                                </Text>
+                                {isFKColumn && (
+                                  <TouchableOpacity
+                                    style={styles.fkConfigExpandButton}
+                                    onPress={handleExpandFK}
+                                  >
+                                    <Text style={styles.fkConfigExpandButtonText}>
+                                      {hasNestedLevel ? '▼' : '▶'}
+                                    </Text>
+                                  </TouchableOpacity>
+                                )}
+                              </View>
+                            </View>
+                          );
+                        })}
+                      </ScrollView>
+                      
+                      {/* Recursively render deeper nested levels */}
+                      {Array.from(levelNestedLevels.entries()).map(([nestedCol, nestedLevel]) => (
+                        <View key={`${parentCol}-${nestedCol}`} style={styles.fkConfigLevelPanel}>
+                          <Text style={styles.fkConfigLevelTitle}>
+                            {nestedLevel.fk.referencedTable}
+                          </Text>
+                          <ScrollView style={styles.fkConfigLevelColumnsList}>
+                            {nestedLevel.columns.map((colName) => {
+                              const isSelected = nestedLevel.selectedColumns.has(colName);
+                              
+                              const handleToggleColumn = () => {
+                                const newSelected = new Set(nestedLevel.selectedColumns);
+                                if (isSelected) {
+                                  newSelected.delete(colName);
+                                } else {
+                                  newSelected.add(colName);
+                                }
+                                
+                                const newNestedLevels = new Map(fkRecordModalNestedSelection.nestedLevels);
+                                newNestedLevels.set(nestedCol, {
+                                  ...nestedLevel,
+                                  selectedColumns: newSelected,
+                                });
+                                
+                                setFKRecordModalNestedSelection({
+                                  ...fkRecordModalNestedSelection,
+                                  nestedLevels: newNestedLevels,
+                                });
+                              };
+                              
+                              return (
+                                <View key={colName} style={styles.fkConfigColumnItem}>
+                                  <View style={styles.fkConfigColumnItemContent}>
+                                    <TouchableOpacity
+                                      style={styles.fkConfigCheckbox}
+                                      onPress={handleToggleColumn}
+                                    >
+                                      <Text style={styles.fkConfigCheckboxText}>
+                                        {isSelected ? '✓' : '○'}
+                                      </Text>
+                                    </TouchableOpacity>
+                                    <Text style={[
+                                      styles.fkConfigColumnItemText,
+                                      isSelected && styles.fkConfigColumnItemTextSelected,
+                                    ]}>
+                                      {colName}
+                                    </Text>
+                                  </View>
+                                </View>
+                              );
+                            })}
+                          </ScrollView>
+                        </View>
+                      ))}
+                    </View>
+                  );
+                })}
+              </ScrollView>
+              
+              {/* Apply button */}
+              <View style={styles.fkRecordModalFooter}>
+                <TouchableOpacity
+                  style={styles.fkRecordApplyButton}
+                  onPress={() => {
+                    if (!onFKLookupConfigChange) return;
+                    
+                    // Build all selected lookup columns recursively
+                    const newConfig = { ...fkLookupConfig };
+                    const existingConfig = newConfig[fkRecordModalData.fkColumn] || { lookupColumns: [] };
+                    const existingLookupColumns = existingConfig.lookupColumns || [];
+                    const newLookupColumns: FKLookupColumn[] = [];
+                    
+                    // Helper to build nested FK config recursively
+                    const buildNestedFK = (parentCol: string, level: {
+                      fk: ForeignKeyInfo;
+                      columns: string[];
+                      fks: ForeignKeyInfo[];
+                      selectedColumns: Set<string>;
+                    }, allNestedLevels: Map<string, {
+                      fk: ForeignKeyInfo;
+                      columns: string[];
+                      fks: ForeignKeyInfo[];
+                      selectedColumns: Set<string>;
+                    }>): FKLookupColumn['nestedFK'] | undefined => {
+                      if (!level.selectedColumns.size) return undefined;
+                      
+                      // For each selected column, create a nested FK entry
+                      // For now, we'll create one entry per selected column
+                      const selectedCol = Array.from(level.selectedColumns)[0];
+                      const deeperLevel = allNestedLevels.get(selectedCol);
+                      
+                      return {
+                        fk: level.fk,
+                        lookupColumn: selectedCol,
+                        // Recursively build deeper nested FK if exists
+                        ...(deeperLevel && deeperLevel.selectedColumns.size ? {
+                          nestedFK: buildNestedFK(selectedCol, deeperLevel, allNestedLevels)
+                        } : {}),
+                      } as FKLookupColumn['nestedFK'];
+                    };
+                    
+                    // Add all selected columns from the first level
+                    for (const colName of fkRecordModalNestedSelection.selectedColumns) {
+                      const nestedLevel = fkRecordModalNestedSelection.nestedLevels.get(colName);
+                      
+                      if (nestedLevel && nestedLevel.selectedColumns.size > 0) {
+                        // Has nested selection - build recursive nested FK
+                        const nestedFK = buildNestedFK(colName, nestedLevel, fkRecordModalNestedSelection.nestedLevels);
+                        if (nestedFK) {
+                          newLookupColumns.push({
+                            fk: fkRecordModalData.fk,
+                            lookupColumn: fkRecordModalNestedSelection.columnName,
+                            nestedFK: {
+                              fk: fkRecordModalNestedSelection.fk,
+                              lookupColumn: colName,
+                              nestedFK: nestedFK,
+                            },
+                          });
+                        }
+                      } else {
+                        // Direct lookup - no nesting
+                        newLookupColumns.push({
+                          fk: fkRecordModalData.fk,
+                          lookupColumn: fkRecordModalNestedSelection.columnName,
+                          nestedFK: {
+                            fk: fkRecordModalNestedSelection.fk,
+                            lookupColumn: colName,
+                          },
+                        });
+                      }
+                    }
+                    
+                    // Merge with existing, avoiding duplicates
+                    const allLookupColumns = [...existingLookupColumns];
+                    for (const newLC of newLookupColumns) {
+                      const exists = allLookupColumns.some(lc => 
+                        lc.lookupColumn === newLC.lookupColumn &&
+                        (!lc.nestedFK && !newLC.nestedFK || 
+                         (lc.nestedFK && newLC.nestedFK &&
+                          lc.nestedFK.lookupColumn === newLC.nestedFK.lookupColumn &&
+                          lc.nestedFK.fk.referencedTable === newLC.nestedFK.fk.referencedTable))
+                      );
+                      if (!exists) {
+                        allLookupColumns.push(newLC);
+                      }
+                    }
+                    
+                    newConfig[fkRecordModalData.fkColumn] = {
+                      lookupColumns: allLookupColumns,
+                    };
+                    
+                    onFKLookupConfigChange(newConfig);
+                    setFKRecordModalNestedSelection(null);
+                  }}
+                >
+                  <Text style={styles.fkRecordApplyButtonText}>Apply</Text>
+                </TouchableOpacity>
               </View>
             </TouchableOpacity>
           </TouchableOpacity>
@@ -2241,6 +3151,11 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#333',
   },
+  contextMenuSubtext: {
+    fontSize: 12,
+    color: '#666',
+    fontStyle: 'italic',
+  },
   tableHeaderCellContainer: {
     flexDirection: 'row',
     position: 'relative',
@@ -2298,6 +3213,184 @@ const styles = StyleSheet.create({
   },
   fkLinkText: {
     color: '#667eea',
+    textDecorationLine: 'underline',
+  },
+  focusedRow: {
+    backgroundColor: '#f0f4ff',
+    borderLeftWidth: 3,
+    borderLeftColor: '#667eea',
+  },
+  focusedCell: {
+    backgroundColor: '#e8f0ff',
+    borderLeftWidth: 2,
+    borderLeftColor: '#667eea',
+  },
+  fkRecordModalContent: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    width: '90%',
+    maxWidth: 600,
+    maxHeight: '80%',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  fkRecordModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#e0e0e0',
+  },
+  fkRecordModalTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#333',
+    flex: 1,
+  },
+  fkRecordModalBody: {
+    padding: 20,
+    maxHeight: 400,
+  },
+  fkRecordField: {
+    flexDirection: 'row',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0f0f0',
+    alignItems: 'center',
+  },
+  fkRecordFieldFK: {
+    backgroundColor: '#f5f5f5',
+    opacity: 0.7,
+  },
+  fkRecordFieldActive: {
+    backgroundColor: '#e8f0ff',
+  },
+  fkRecordFieldLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#666',
+    width: 150,
+    marginRight: 16,
+  },
+  fkRecordFieldLabelFK: {
+    color: '#999',
+    fontStyle: 'italic',
+  },
+  fkRecordFieldLabelActive: {
+    color: '#667eea',
+  },
+  fkRecordFieldValue: {
+    fontSize: 14,
+    color: '#333',
+    flex: 1,
+    fontFamily: 'monospace',
+  },
+  fkRecordFieldValueFK: {
+    color: '#999',
+  },
+  fkRecordToggleIconButton: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 8,
+  },
+  fkRecordToggleIconButtonAdd: {
+    backgroundColor: '#9eb5d4',
+  },
+  fkRecordToggleIconButtonRemove: {
+    backgroundColor: '#d4a5a5',
+  },
+  fkRecordToggleIconButtonPlaceholder: {
+    width: 24,
+    height: 24,
+    marginRight: 8,
+  },
+  fkRecordToggleIconButtonText: {
+    fontSize: 16,
+    color: '#fff',
+    fontWeight: 'bold',
+    lineHeight: 20,
+  },
+  fkRecordModalFooter: {
+    padding: 16,
+    borderTopWidth: 1,
+    borderTopColor: '#e0e0e0',
+  },
+  fkRecordViewLink: {
+    alignItems: 'flex-end',
+  },
+  fkRecordViewLinkText: {
+    color: '#667eea',
+    fontSize: 16,
+    fontWeight: '500',
+    textDecorationLine: 'underline',
+  },
+  fkHoverModal: {
+    backgroundColor: '#fff',
+    borderRadius: 8,
+    width: 280,
+    maxHeight: 300,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 8,
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+  },
+  fkHoverModalContent: {
+    padding: 12,
+    maxHeight: 280,
+  },
+  fkHoverModalRow: {
+    flexDirection: 'row',
+    paddingVertical: 4,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0f0f0',
+  },
+  fkHoverModalLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#666',
+    width: 80,
+    marginRight: 8,
+  },
+  fkHoverModalValue: {
+    fontSize: 12,
+    color: '#333',
+    flex: 1,
+    fontFamily: 'monospace',
+  },
+  fkHoverModalText: {
+    fontSize: 12,
+    color: '#666',
+    padding: 12,
+  },
+  fkHoverModalMore: {
+    fontSize: 11,
+    color: '#999',
+    fontStyle: 'italic',
+    paddingTop: 4,
+    textAlign: 'center',
+  },
+  fkHoverModalLink: {
+    marginTop: 8,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#e0e0e0',
+    alignItems: 'flex-end',
+  },
+  fkHoverModalLinkText: {
+    color: '#667eea',
+    fontSize: 12,
+    fontWeight: '500',
     textDecorationLine: 'underline',
   },
   fkConfigModalContent: {
@@ -2378,14 +3471,22 @@ const styles = StyleSheet.create({
     borderBottomColor: '#f0f0f0',
     backgroundColor: '#fff',
   },
-  fkConfigColumnItemSelected: {
+  fkConfigColumnItemFK: {
+    backgroundColor: '#f5f5f5',
+    opacity: 0.7,
+  },
+  fkConfigColumnItemActive: {
     backgroundColor: '#e8f0ff',
   },
   fkConfigColumnItemText: {
     fontSize: 14,
     color: '#333',
   },
-  fkConfigColumnItemTextSelected: {
+  fkConfigColumnItemTextFK: {
+    color: '#999',
+    fontStyle: 'italic',
+  },
+  fkConfigColumnItemTextActive: {
     color: '#667eea',
     fontWeight: '600',
   },
@@ -2400,11 +3501,73 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
   },
+  fkConfigColumnItemLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+  },
   fkConfigColumnFKIndicator: {
     fontSize: 12,
     color: '#667eea',
     fontStyle: 'italic',
     marginLeft: 8,
+  },
+  fkConfigToggleButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    backgroundColor: '#667eea',
+    borderRadius: 4,
+    minWidth: 60,
+    alignItems: 'center',
+  },
+  fkConfigToggleButtonActive: {
+    backgroundColor: '#dc3545',
+  },
+  fkConfigToggleButtonText: {
+    fontSize: 12,
+    color: '#fff',
+    fontWeight: '600',
+  },
+  fkConfigToggleButtonTextActive: {
+    color: '#fff',
+  },
+  fkConfigCheckbox: {
+    width: 24,
+    height: 24,
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: '#ccc',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 8,
+  },
+  fkConfigCheckboxText: {
+    fontSize: 14,
+    color: '#667eea',
+    fontWeight: 'bold',
+  },
+  fkConfigExpandButton: {
+    width: 24,
+    height: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 8,
+  },
+  fkConfigExpandButtonText: {
+    fontSize: 12,
+    color: '#667eea',
+  },
+  fkRecordApplyButton: {
+    backgroundColor: '#667eea',
+    paddingHorizontal: 24,
+    paddingVertical: 12,
+    borderRadius: 4,
+    alignItems: 'center',
+  },
+  fkRecordApplyButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
   },
 });
 

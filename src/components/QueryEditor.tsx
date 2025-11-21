@@ -16,6 +16,9 @@ import {
     Platform,
 } from 'react-native';
 
+// Web-specific div component
+const WebDiv = Platform.OS === 'web' ? 'div' : View;
+
 export interface QueryEditorProps {
     value: string;
     onChangeText: (text: string) => void;
@@ -41,12 +44,17 @@ export default function QueryEditor({
     showCollapseButton = false,
     onCollapse,
 }: QueryEditorProps) {
-    const [height, setHeight] = useState(40); // Initial height for single line
+    // Default height matches sidebar header (65px), can expand in row increments
+    const HEADER_HEIGHT = 64; // Matches sidebar databaseDropdownRow minHeight
+    const ROW_HEIGHT = 35; // Approximate row height for snapping
+    const startRows = 0;
+    const [containerHeight, setContainerHeight] = useState(HEADER_HEIGHT + startRows * ROW_HEIGHT); // Default to header + 1 row to prove it works
     const [isResizing, setIsResizing] = useState(false);
-    const [resizeStartY, setResizeStartY] = useState(0);
-    const [resizeStartHeight, setResizeStartHeight] = useState(40);
+    const resizeStartYRef = useRef(0);
+    const resizeStartHeightRef = useRef(HEADER_HEIGHT + startRows * ROW_HEIGHT);
     const inputRef = useRef<TextInput>(null);
     const domElementRef = useRef<HTMLTextAreaElement | HTMLInputElement | null>(null);
+    const resizeHandleRef = useRef<View | null>(null);
     const handlerRef = useRef<((e: Event) => void) | null>(null);
     const valueRef = useRef(value);
     const disabledRef = useRef(disabled);
@@ -60,68 +68,119 @@ export default function QueryEditor({
         loadingRef.current = loading;
         onExecuteRef.current = onExecute;
     }, [value, disabled, loading, onExecute]);
-    const minHeight = 40;
-    const maxAutoHeight = 120; // ~5 lines at 24px line height
-    const maxManualHeight = 400;
+    const minHeight = HEADER_HEIGHT; // Minimum is header height
+    const maxManualHeight = HEADER_HEIGHT + (ROW_HEIGHT * 10); // Allow up to 10 rows
 
-    // Calculate auto height based on content
-    const calculateAutoHeight = useCallback((text: string): number => {
+    // Calculate textarea height based on content (within container)
+    const calculateTextareaHeight = useCallback((text: string): number => {
+        if (!text || text.trim() === '') return 40;
         const lineCount = (text.match(/\n/g) || []).length + 1;
         const lineHeight = 24; // Approximate line height
         const padding = 16; // Top and bottom padding
         const calculatedHeight = lineCount * lineHeight + padding;
-        return Math.min(Math.max(calculatedHeight, minHeight), maxAutoHeight);
+        // Textarea height should fit within container, but can expand container if needed
+        return Math.max(calculatedHeight, 40);
     }, []);
 
-    // Update height when value changes (auto-expand)
+    // Calculate textarea height based on content
+    const [textareaHeight, setTextareaHeight] = useState(40);
+    
+    // Update textarea height when value changes (but don't change container height unless needed)
     useEffect(() => {
-        if (!isResizing && height < maxAutoHeight) {
-            const newHeight = calculateAutoHeight(value);
-            setHeight(newHeight);
+        if (!isResizing) {
+            // On web, use scrollHeight for accurate height
+            if (Platform.OS === 'web' && domElementRef.current) {
+                const domEl = domElementRef.current as any;
+                if (domEl && typeof domEl.scrollHeight !== 'undefined') {
+                    // Reset height to auto to get accurate scrollHeight
+                    domEl.style.height = 'auto';
+                    const scrollHeight = domEl.scrollHeight;
+                    // Set textarea height
+                    domEl.style.height = `${scrollHeight}px`;
+                    domEl.style.overflow = 'hidden';
+                    domEl.style.maxHeight = 'none';
+                    setTextareaHeight(scrollHeight);
+                    
+                    // If textarea needs more space than container, expand container to next row increment
+                    const containerPadding = 24; // 12px top + 12px bottom
+                    const neededHeight = scrollHeight + containerPadding;
+                    if (neededHeight > containerHeight) {
+                        // Snap to next row increment
+                        const rowsNeeded = Math.ceil((neededHeight - HEADER_HEIGHT) / ROW_HEIGHT);
+                        const snappedHeight = HEADER_HEIGHT + (rowsNeeded * ROW_HEIGHT);
+                        setContainerHeight(snappedHeight);
+                    }
+                    return;
+                }
+            }
+            
+            // Fallback to calculated height
+            const newHeight = calculateTextareaHeight(value);
+            setTextareaHeight(newHeight);
+            
+            // Check if container needs to expand
+            const containerPadding = 24;
+            const neededHeight = newHeight + containerPadding;
+            if (neededHeight > containerHeight && !isResizing) {
+                const rowsNeeded = Math.ceil((neededHeight - HEADER_HEIGHT) / ROW_HEIGHT);
+                const snappedHeight = HEADER_HEIGHT + (rowsNeeded * ROW_HEIGHT);
+                setContainerHeight(snappedHeight);
+            }
         }
-    }, [value, calculateAutoHeight, isResizing, height]);
+    }, [value, calculateTextareaHeight, isResizing, containerHeight]);
 
-    // Handle resize start (web)
+    // Handle resize start (web) - resize the container
     const handleResizeStart = useCallback((e: any) => {
         if (Platform.OS !== 'web') return;
+        console.log('[QueryEditor] Resize start', e);
         e.preventDefault();
         e.stopPropagation();
-        setIsResizing(true);
         const clientY = e.clientY || e.nativeEvent?.clientY || 0;
-        setResizeStartY(clientY);
-        setResizeStartHeight(height);
-    }, [height]);
+        resizeStartYRef.current = clientY;
+        resizeStartHeightRef.current = containerHeight;
+        console.log('[QueryEditor] Starting resize at Y:', clientY, 'current height:', containerHeight);
+        setIsResizing(true);
+    }, [containerHeight]);
 
-    // Handle resize move (web)
+    // Handle resize move (web) - snap to row increments
     useEffect(() => {
-        if (Platform.OS !== 'web' || typeof document === 'undefined') return;
+        if (Platform.OS !== 'web') return;
+        const doc = typeof (global as any).document !== 'undefined' ? (global as any).document : null;
+        if (!doc) return;
 
-        const handleMouseMove = (e: MouseEvent) => {
+        const handleMouseMove = (e: any) => {
             if (!isResizing) return;
-            const diff = resizeStartY - e.clientY; // Inverted because we're resizing from bottom
+            const clientY = e.clientY || 0;
+            // When dragging down (clientY increases), diff should be positive to increase height
+            const diff = clientY - resizeStartYRef.current;
+            const rawHeight = resizeStartHeightRef.current + diff;
+            
+            // Snap to row increments
+            const rows = Math.round((rawHeight - HEADER_HEIGHT) / ROW_HEIGHT);
+            const snappedHeight = HEADER_HEIGHT + (rows * ROW_HEIGHT);
+            
             const newHeight = Math.min(
-                Math.max(resizeStartHeight + diff, minHeight),
+                Math.max(snappedHeight, minHeight),
                 maxManualHeight
             );
-            setHeight(newHeight);
+            console.log('[QueryEditor] Mouse move - Y:', clientY, 'startY:', resizeStartYRef.current, 'diff:', diff, 'rawHeight:', rawHeight, 'rows:', rows, 'snappedHeight:', snappedHeight, 'new height:', newHeight);
+            setContainerHeight(newHeight);
         };
 
         const handleMouseUp = () => {
-            if (isResizing) {
-                setIsResizing(false);
-            }
+            setIsResizing(false);
         };
 
         if (isResizing) {
-            document.addEventListener('mousemove', handleMouseMove);
-            document.addEventListener('mouseup', handleMouseUp);
+            doc.addEventListener('mousemove', handleMouseMove);
+            doc.addEventListener('mouseup', handleMouseUp);
+            
+            return () => {
+                doc.removeEventListener('mousemove', handleMouseMove);
+                doc.removeEventListener('mouseup', handleMouseUp);
+            };
         }
-
-        return () => {
-            document.removeEventListener('mousemove', handleMouseMove);
-            document.removeEventListener('mouseup', handleMouseUp);
-        };
-    }, [isResizing, resizeStartY, resizeStartHeight]);
+    }, [isResizing, minHeight, maxManualHeight]);
 
     // Set up ref callback to capture DOM element directly
     const setInputRef = useCallback((node: TextInput | null) => {
@@ -167,6 +226,48 @@ export default function QueryEditor({
                     
                     domElementRef.current = domEl;
                     
+                    // Directly set overflow style to prevent scrolling and allow expansion
+                    const domElAny = domEl as any;
+                    if (domElAny && typeof domElAny.scrollHeight !== 'undefined') {
+                        // Remove any max-height constraints from textarea
+                        domElAny.style.overflow = 'hidden';
+                        domElAny.style.maxHeight = 'none';
+                        domElAny.style.resize = 'none';
+                        // Set initial height based on scrollHeight
+                        domElAny.style.height = 'auto';
+                        domElAny.style.height = `${domElAny.scrollHeight}px`;
+                        
+                        // Also remove constraints from parent container
+                        let parent = domElAny.parentElement;
+                        let depth = 0;
+                        while (parent && depth < 5) {
+                            const parentAny = parent as any;
+                            parentAny.style.maxHeight = 'none';
+                            parentAny.style.overflow = 'visible';
+                            parent = parent.parentElement;
+                            depth++;
+                        }
+                        
+                        // Update height when content changes
+                        const updateHeight = () => {
+                            if (domElAny && typeof domElAny.scrollHeight !== 'undefined') {
+                                domElAny.style.height = 'auto';
+                                domElAny.style.height = `${domElAny.scrollHeight}px`;
+                                setTextareaHeight(domElAny.scrollHeight);
+                                
+                                // Check if container needs to expand
+                                const containerPadding = 24;
+                                const neededHeight = domElAny.scrollHeight + containerPadding;
+                                if (neededHeight > containerHeight) {
+                                    const rowsNeeded = Math.ceil((neededHeight - HEADER_HEIGHT) / ROW_HEIGHT);
+                                    const snappedHeight = HEADER_HEIGHT + (rowsNeeded * ROW_HEIGHT);
+                                    setContainerHeight(snappedHeight);
+                                }
+                            }
+                        };
+                        domElAny.addEventListener('input', updateHeight);
+                    }
+                    
                     // Create new handler that uses refs for latest values
                     const handleKeyDown = (e: Event) => {
                         const keyEvent = e as KeyboardEvent;
@@ -211,8 +312,13 @@ export default function QueryEditor({
         };
     }, []);
 
+
+    console.log('[QueryEditor] Rendering with containerHeight:', containerHeight);
+    
     return (
-        <View style={styles.container}>
+        <View 
+            style={[styles.container, { height: containerHeight }]}
+        >
             {showExpandButton && onExpand && (
                 <TouchableOpacity
                     style={styles.expandButton}
@@ -230,7 +336,7 @@ export default function QueryEditor({
                 </TouchableOpacity>
             )}
             <View 
-                style={styles.inputContainer}
+                style={[styles.inputContainer, { maxHeight: undefined }]}
                 {...(Platform.OS === 'web' ? {
                     onKeyDown: (e: any) => {
                         const event = e.nativeEvent || e;
@@ -255,7 +361,7 @@ export default function QueryEditor({
                     ref={setInputRef}
                     style={[
                         styles.input,
-                        { height: Math.max(height, minHeight) },
+                        { height: textareaHeight },
                         disabled && styles.inputDisabled,
                     ]}
                     value={value}
@@ -268,18 +374,42 @@ export default function QueryEditor({
                     autoCorrect={false}
                     spellCheck={false}
                     editable={!disabled}
-                    scrollEnabled={height >= maxAutoHeight}
+                    scrollEnabled={false}
                 />
-                {Platform.OS === 'web' && (
-                    <View
-                        style={[
-                            styles.resizeHandle,
-                            isResizing && styles.resizeHandleActive,
-                        ]}
-                        onMouseDown={handleResizeStart}
-                    />
-                )}
             </View>
+            {Platform.OS === 'web' ? React.createElement('div', {
+                ref: resizeHandleRef as any,
+                style: {
+                    position: 'absolute',
+                    bottom: 0,
+                    left: 0,
+                    right: 0,
+                    height: 12,
+                    backgroundColor: isResizing ? 'rgba(102, 126, 234, 0.2)' : 'transparent',
+                    cursor: 'ns-resize',
+                    zIndex: 10,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                },
+                onMouseDown: (e: any) => {
+                    console.log('[QueryEditor] Div mousedown!', e);
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const clientY = e.clientY || 0;
+                    resizeStartYRef.current = clientY;
+                    resizeStartHeightRef.current = containerHeight;
+                    console.log('[QueryEditor] Setting isResizing to true, Y:', clientY, 'height:', containerHeight);
+                    setIsResizing(true);
+                },
+            }, React.createElement('div', {
+                style: {
+                    width: 40,
+                    height: 4,
+                    backgroundColor: isResizing ? '#667eea' : 'rgba(102, 126, 234, 0.3)',
+                    borderRadius: 2,
+                }
+            })) : null}
             <TouchableOpacity
                 style={[styles.executeButton, (disabled || !value.trim() || loading) && styles.executeButtonDisabled]}
                 onPress={onExecute}
@@ -304,6 +434,8 @@ const styles = StyleSheet.create({
         borderBottomWidth: 1,
         borderBottomColor: '#e0e0e0',
         backgroundColor: '#fafafa',
+        position: 'relative',
+        overflow: 'visible',
     },
     expandButton: {
         padding: 8,
@@ -330,7 +462,6 @@ const styles = StyleSheet.create({
         fontFamily: 'monospace',
         backgroundColor: '#fff',
         minHeight: 40,
-        maxHeight: 400,
     },
     inputDisabled: {
         backgroundColor: '#f5f5f5',
@@ -339,13 +470,14 @@ const styles = StyleSheet.create({
     resizeHandle: {
         position: 'absolute',
         bottom: 0,
+        left: 0,
         right: 0,
-        width: 20,
-        height: 8,
-        backgroundColor: 'rgba(102, 126, 234, 0.1)',
-        borderTopLeftRadius: 4,
+        height: 12,
+        backgroundColor: 'transparent',
         cursor: 'ns-resize',
         zIndex: 10,
+        alignItems: 'center',
+        justifyContent: 'center',
     },
     resizeHandleActive: {
         backgroundColor: '#667eea',
