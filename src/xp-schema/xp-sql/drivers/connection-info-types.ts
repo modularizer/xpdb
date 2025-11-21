@@ -43,3 +43,4 @@ type PgDiscreteConfig = PgCommonOptions & {
 export type PostgresConnectionInfo =
     DbConnectionInfo & (PgConnectionStringConfig | PgDiscreteConfig);
 
+

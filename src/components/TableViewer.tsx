@@ -17,6 +17,9 @@ import {
   Platform,
 } from 'react-native';
 import { determineLookupColumn } from '../utils/fk-utils';
+import { formatterRegistry } from './TableViewer/formatters/formatter-registry';
+import { autoDetectFormatter } from './TableViewer/formatters/auto-formatter';
+import type { ColumnFormatConfig, FormatterOptions } from './TableViewer/formatters/formatter.interface';
 
 export interface TableViewerColumn {
   name: string;
@@ -203,6 +206,8 @@ export default function TableViewer({
   const hoverModalExpandTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const cellRefsForHover = useRef<Map<string, { x: number; y: number; width: number; height: number }>>(new Map());
   const headerRefs = useRef<Map<string, any>>(new Map());
+  // Store text element refs for overflow detection: Map<columnName, Map<rowIndex, HTMLElement>>
+  const textElementRefs = useRef<Map<string, Map<number, HTMLElement>>>(new Map());
   
   // Helper function to show FK record modal
   const showFKRecordModalForCell = useCallback(async (fkColumn: string, fkValue: any, fk: ForeignKeyInfo) => {
@@ -259,6 +264,13 @@ export default function TableViewer({
   const [fkConfigAvailableColumns, setFKConfigAvailableColumns] = useState<string[]>([]);
   const [fkConfigReferencedTableFKs, setFKConfigReferencedTableFKs] = useState<ForeignKeyInfo[]>([]);
   
+  // Column formatting configuration
+  const [columnFormatConfigs, setColumnFormatConfigs] = useState<Map<string, ColumnFormatConfig>>(new Map());
+  const [showFormatConfigModal, setShowFormatConfigModal] = useState(false);
+  const [formatConfigColumn, setFormatConfigColumn] = useState<string | null>(null);
+  const [formatConfigType, setFormatConfigType] = useState<string>('auto');
+  const [formatConfigOptions, setFormatConfigOptions] = useState<FormatterOptions>({});
+  
   // Cascading FK selection state - tracks the path of FK selections
   type FKSelectionLevel = {
     tableName: string;
@@ -268,29 +280,268 @@ export default function TableViewer({
     selectedFK?: ForeignKeyInfo;
   };
   const [fkConfigSelectionPath, setFKConfigSelectionPath] = useState<FKSelectionLevel[]>([]);
+  
+  // Cache for auto-detected formatters per column (to avoid re-detecting on every render)
+  const autoDetectedFormatters = useRef<Map<string, { type: string; options?: FormatterOptions }>>(new Map());
+  
+  // Clear auto-detection cache when rows, columns, or column widths change
+  useEffect(() => {
+    autoDetectedFormatters.current.clear();
+  }, [rows, columns, columnWidths]);
 
-  const defaultFormatValue = useCallback((value: any): string => {
-    if (value === null || value === undefined) return '';
-    if (typeof value === 'object') return JSON.stringify(value);
-    if (typeof value === 'boolean') return value ? 'true' : 'false';
+  // Get column width (default 180)
+  const getColumnWidth = useCallback((columnName: string): number => {
+    return columnWidths.get(columnName) ?? 180;
+  }, [columnWidths]);
+
+  // Format number using the formatter system
+  const formatNumber = useCallback((value: number, columnName: string): string | { number: string; suffix: string } => {
+    // Check for custom format configuration
+    const formatConfig = columnFormatConfigs.get(columnName);
+    let formatterType = formatConfig?.type || 'auto';
+    let formatterOptions = formatConfig?.options;
+    
+    // If auto, detect the best formatter (with caching)
+    if (formatterType === 'auto') {
+      // Check cache first
+      if (!autoDetectedFormatters.current.has(columnName)) {
+        const column = columns.find(c => c.name === columnName);
+        const columnValues = rows.map(row => row[columnName]).filter(v => v !== null && v !== undefined);
+        const columnWidth = getColumnWidth(columnName);
+        const detected = autoDetectFormatter(columnValues, columnName, column?.dataType, columnWidth);
+        autoDetectedFormatters.current.set(columnName, detected);
+      }
+      const detected = autoDetectedFormatters.current.get(columnName)!;
+      formatterType = detected.type;
+      formatterOptions = detected.options;
+    }
+    
+    // Get the formatter from registry
+    const formatter = formatterRegistry.get(formatterType);
+    if (formatter) {
+      const options = formatterOptions || formatter.getDefaultOptions();
+      return formatter.format(value, options);
+    }
+    
+    // Ultimate fallback
     return String(value);
+  }, [columnFormatConfigs, rows, columns, getColumnWidth]);
+
+  // Format date as M/D/Y 12h
+  const formatDate = useCallback((value: any): string => {
+    let date: Date;
+    if (value instanceof Date) {
+      date = value;
+    } else if (typeof value === 'string' || typeof value === 'number') {
+      date = new Date(value);
+    } else {
+      return String(value);
+    }
+    
+    if (isNaN(date.getTime())) {
+      return String(value); // Invalid date, return original
+    }
+    
+    // Format as M/D/Y 12h (e.g., "1/15/2024 3:45 PM")
+    const month = date.getMonth() + 1;
+    const day = date.getDate();
+    const year = date.getFullYear();
+    let hours = date.getHours();
+    const minutes = date.getMinutes();
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    hours = hours % 12;
+    hours = hours ? hours : 12; // 0 should be 12
+    const minutesStr = minutes < 10 ? `0${minutes}` : String(minutes);
+    
+    return `${month}/${day}/${year} ${hours}:${minutesStr} ${ampm}`;
   }, []);
 
-  const formatCellValue = useCallback((value: any, column: string): string => {
-    if (formatValue) {
-      return formatValue(value, column);
+  // Check if value looks like a date
+  const isDateValue = useCallback((value: any): boolean => {
+    if (value instanceof Date) return true;
+    if (typeof value === 'string') {
+      // Check if it's a date string (ISO format, or common date formats)
+      const dateRegex = /^\d{4}-\d{2}-\d{2}/; // ISO date
+      const dateTimeRegex = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/; // ISO datetime
+      if (dateRegex.test(value) || dateTimeRegex.test(value)) {
+        const date = new Date(value);
+        return !isNaN(date.getTime());
+      }
     }
-    return defaultFormatValue(value);
+    if (typeof value === 'number') {
+      // Could be a timestamp
+      const date = new Date(value);
+      return !isNaN(date.getTime()) && value > 0 && value < 1e15; // Reasonable timestamp range
+    }
+    return false;
+  }, []);
+
+  // Detect if a value is a color (hex, rgb, rgba, etc.)
+  const isColorValue = useCallback((value: any): boolean => {
+    if (typeof value !== 'string') return false;
+    const str = value.trim().toLowerCase();
+    
+    // Hex colors: #rgb, #rrggbb, #rrggbbaa
+    if (/^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(str)) return true;
+    
+    // rgb/rgba colors: rgb(255, 255, 255) or rgba(255, 255, 255, 0.5)
+    if (/^rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+(?:\s*,\s*[\d.]+)?\s*\)$/i.test(str)) return true;
+    
+    // Named colors (basic set)
+    const namedColors = ['red', 'green', 'blue', 'black', 'white', 'yellow', 'cyan', 'magenta', 'orange', 'purple', 'pink', 'brown', 'gray', 'grey'];
+    if (namedColors.includes(str)) return true;
+    
+    return false;
+  }, []);
+
+  // Parse color value to hex for rendering
+  const parseColorToHex = useCallback((value: string): string => {
+    const str = value.trim().toLowerCase();
+    
+    // Already hex
+    if (str.startsWith('#')) {
+      // Expand short hex (#rgb -> #rrggbb)
+      if (str.length === 4) {
+        return '#' + str[1] + str[1] + str[2] + str[2] + str[3] + str[3];
+      }
+      return str.substring(0, 7); // Take only RGB, ignore alpha
+    }
+    
+    // rgb/rgba
+    const rgbMatch = str.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+    if (rgbMatch) {
+      const r = parseInt(rgbMatch[1], 10).toString(16).padStart(2, '0');
+      const g = parseInt(rgbMatch[2], 10).toString(16).padStart(2, '0');
+      const b = parseInt(rgbMatch[3], 10).toString(16).padStart(2, '0');
+      return `#${r}${g}${b}`;
+    }
+    
+    // Named colors
+    const colorMap: Record<string, string> = {
+      red: '#ff0000', green: '#00ff00', blue: '#0000ff', black: '#000000',
+      white: '#ffffff', yellow: '#ffff00', cyan: '#00ffff', magenta: '#ff00ff',
+      orange: '#ffa500', purple: '#800080', pink: '#ffc0cb', brown: '#a52a2a',
+      gray: '#808080', grey: '#808080'
+    };
+    return colorMap[str] || '#000000';
+  }, []);
+
+  // Detect if a value is a URL
+  const isURLValue = useCallback((value: any): boolean => {
+    if (typeof value !== 'string') return false;
+    const str = value.trim();
+    try {
+      const url = new URL(str);
+      return url.protocol === 'http:' || url.protocol === 'https:' || url.protocol === 'ftp:';
+    } catch {
+      // Also check for common URL patterns without protocol
+      return /^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}(\/.*)?$/i.test(str) ||
+             /^www\.[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}(\/.*)?$/i.test(str);
+    }
+  }, []);
+
+  // Normalize URL (add protocol if missing)
+  const normalizeURL = useCallback((value: string): string => {
+    const str = value.trim();
+    if (str.startsWith('http://') || str.startsWith('https://') || str.startsWith('ftp://')) {
+      return str;
+    }
+    if (str.startsWith('www.')) {
+      return 'https://' + str;
+    }
+    return 'https://' + str;
+  }, []);
+
+  // Check if column is an enum type
+  const isEnumColumn = useCallback((column: TableViewerColumn | undefined): boolean => {
+    if (!column) return false;
+    const lowerDataType = column.dataType?.toLowerCase() || '';
+    return lowerDataType.includes('enum');
+  }, []);
+
+  // Generate a color for enum value (consistent hash-based color)
+  const getEnumColor = useCallback((value: string): string => {
+    // Simple hash function to generate consistent colors
+    let hash = 0;
+    for (let i = 0; i < value.length; i++) {
+      hash = value.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    const hue = Math.abs(hash) % 360;
+    // Use HSL with fixed saturation and lightness for good visibility
+    return `hsl(${hue}, 70%, 50%)`;
+  }, []);
+
+  // Format date using the formatter system
+  const formatDateValue = useCallback((value: any, columnName: string): string => {
+    const formatConfig = columnFormatConfigs.get(columnName);
+    let formatterType = formatConfig?.type || 'auto';
+    let formatterOptions = formatConfig?.options;
+
+    // If auto, check if column is date/timestamp type
+    if (formatterType === 'auto') {
+      const column = columns.find(c => c.name === columnName);
+      const lowerDataType = column?.dataType?.toLowerCase() || '';
+      if (lowerDataType.includes('timestamp') || lowerDataType.includes('date') || lowerDataType.includes('time')) {
+        formatterType = 'date';
+        formatterOptions = { dateFormat: 'M/D/Y', timeFormat: '12h', showTime: true, showSeconds: false, timezone: 'local' };
+      } else if (isDateValue(value)) {
+        // Fallback to old formatDate for non-configured date values
+        return formatDate(value);
+      } else {
+        return String(value);
+      }
+    }
+
+    // If explicitly set to date formatter
+    if (formatterType === 'date') {
+      const formatter = formatterRegistry.get('date');
+      if (formatter) {
+        const options = formatterOptions || formatter.getDefaultOptions();
+        return formatter.format(value, options) as string;
+      }
+    }
+
+    // Fallback to old formatDate
+    if (isDateValue(value)) {
+      return formatDate(value);
+    }
+    
+    return String(value);
+  }, [columnFormatConfigs, columns, isDateValue, formatDate]);
+
+  const defaultFormatValue = useCallback((value: any, columnName: string): string => {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'boolean') return value ? 'true' : 'false'; // Will be overridden by checkbox rendering
+    if (typeof value === 'number') {
+      const formatted = formatNumber(value, columnName);
+      // Handle suffix notation return type
+      if (typeof formatted === 'object' && formatted !== null && 'number' in formatted && 'suffix' in formatted) {
+        return formatted.number + formatted.suffix;
+      }
+      return formatted as string;
+    }
+    // Check if it's a date value or date column
+    const column = columns.find(c => c.name === columnName);
+    const lowerDataType = column?.dataType?.toLowerCase() || '';
+    if (isDateValue(value) || lowerDataType.includes('timestamp') || lowerDataType.includes('date') || lowerDataType.includes('time')) {
+      return formatDateValue(value, columnName);
+    }
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value);
+  }, [formatNumber, formatDateValue, isDateValue, columns]);
+
+  const formatCellValue = useCallback((value: any, column: string): string | { number: string; suffix: string } => {
+    if (formatValue) {
+      const result = formatValue(value, column);
+      // If formatValue returns a string, wrap it to maintain compatibility
+      return typeof result === 'string' ? result : result;
+    }
+    return defaultFormatValue(value, column);
   }, [formatValue, defaultFormatValue]);
 
   const isValueNull = useCallback((value: any): boolean => {
     return value === null || value === undefined;
   }, []);
-
-  // Get column width (default 150)
-  const getColumnWidth = useCallback((columnName: string): number => {
-    return columnWidths.get(columnName) ?? 150;
-  }, [columnWidths]);
 
   // Handle resize start
   const handleResizeStart = useCallback((columnName: string, startX: number) => {
@@ -372,8 +623,42 @@ export default function TableViewer({
     return String(value);
   }, [columns]);
 
-  // Handle cell click to show modal
-  const handleCellClick = useCallback((value: any, columnName: string) => {
+  // Initialize format config modal when column is selected
+  useEffect(() => {
+    if (showFormatConfigModal && formatConfigColumn) {
+      const existingConfig = columnFormatConfigs.get(formatConfigColumn);
+      if (existingConfig && existingConfig.type !== 'auto') {
+        // Use existing configured format
+        setFormatConfigType(existingConfig.type);
+        setFormatConfigOptions(existingConfig.options || {});
+      } else {
+        // Auto-detect best format for this column
+        const column = columns.find(c => c.name === formatConfigColumn);
+        const columnValues = rows.map(row => row[formatConfigColumn]).filter(v => v !== null && v !== undefined);
+        const columnWidth = getColumnWidth(formatConfigColumn);
+        const detected = autoDetectFormatter(columnValues, formatConfigColumn, column?.dataType, columnWidth);
+        // Set the detected type (which should never be 'auto' since autoDetectFormatter returns a specific type)
+        // Fallback to 'commas' if somehow 'auto' is returned
+        const formatType = detected.type === 'auto' ? 'commas' : detected.type;
+        setFormatConfigType(formatType);
+        setFormatConfigOptions(detected.options || {});
+      }
+    }
+  }, [showFormatConfigModal, formatConfigColumn, columnFormatConfigs, rows, columns, getColumnWidth]);
+
+  // Handle cell click to show modal (only if text is overflowing)
+  const handleCellClick = useCallback((value: any, columnName: string, textElement?: HTMLElement | null) => {
+    // Check if text is overflowing (only on web)
+    if (Platform.OS === 'web' && textElement) {
+      const isOverflowing = textElement.scrollWidth > textElement.clientWidth || 
+                           textElement.scrollHeight > textElement.clientHeight;
+      if (!isOverflowing) {
+        // Text fits, don't show modal
+        return;
+      }
+    }
+    
+    // Show modal if overflowing or on non-web platforms (fallback)
     setCellModalValue(value);
     setCellModalColumn(columnName);
     setShowCellModal(true);
@@ -1164,7 +1449,15 @@ export default function TableViewer({
                             // Show modal with foreign record (on click)
                             await showFKRecordModalForCell(col.name, value, fk);
                           } else {
-                            handleCellClick(value, col.name);
+                            // Get the text element to check for overflow
+                            let textElement: HTMLElement | null = null;
+                            if (Platform.OS === 'web') {
+                              const columnTextRefs = textElementRefs.current.get(col.name);
+                              if (columnTextRefs) {
+                                textElement = columnTextRefs.get(rowIndex) || null;
+                              }
+                            }
+                            handleCellClick(value, col.name, textElement);
                           }
                         }}
                         onLongPress={async () => {
@@ -1176,16 +1469,8 @@ export default function TableViewer({
                           }
                         }}
                         {...(Platform.OS === 'web' ? {
-                          onContextMenu: async (e: any) => {
-                            // Right-click handler - same as regular click for FK cells
-                            e.preventDefault();
-                            e.stopPropagation();
-                            const fk = foreignKeys.find(fk => fk.columns.includes(col.name));
-                            if (fk && !isNull) {
-                              // Show modal with foreign record (on right-click)
-                              await showFKRecordModalForCell(col.name, value, fk);
-                            }
-                          },
+                          // Note: onContextMenu is handled via direct DOM event listener in ref callback for FK cells
+                          // This ensures it works properly and prevents default browser context menu
                           onMouseEnter: async (e: any) => {
                             // Check if this is an FK column
                             const fk = foreignKeys.find(fk => fk.columns.includes(col.name));
@@ -1295,10 +1580,34 @@ export default function TableViewer({
                           const fk = foreignKeys.find(fk => fk.columns.includes(col.name));
                           if (fk && !isNull) {
                             // Show FK value as clickable link
+                            // Check if this is a date/timestamp column
+                            const isDateColumn = col.dataType && (
+                              col.dataType.toLowerCase().includes('date') ||
+                              col.dataType.toLowerCase().includes('time') ||
+                              col.dataType.toLowerCase().includes('timestamp')
+                            );
                             return (
                               <Text
+                                ref={(ref) => {
+                                  if (Platform.OS === 'web' && ref) {
+                                    const element = ref as any;
+                                    let domElement: HTMLElement | null = null;
+                                    if (element._nativeNode) {
+                                      domElement = element._nativeNode;
+                                    } else if (element.nodeType) {
+                                      domElement = element;
+                                    }
+                                    if (domElement) {
+                                      if (!textElementRefs.current.has(col.name)) {
+                                        textElementRefs.current.set(col.name, new Map());
+                                      }
+                                      textElementRefs.current.get(col.name)!.set(rowIndex, domElement);
+                                    }
+                                  }
+                                }}
+                                selectable={true}
                                 style={[
-                                  styles.tableCellText,
+                                  isDateColumn ? styles.tableCellTextDate : styles.tableCellText,
                                   styles.fkLinkText,
                                 ]}
                                 numberOfLines={1}
@@ -1308,16 +1617,90 @@ export default function TableViewer({
                             );
                           }
                           
+                          // Boolean values: render as checkbox
+                          if (typeof value === 'boolean') {
+                            return (
+                              <View style={styles.checkboxContainer}>
+                                <View style={[
+                                  styles.checkbox,
+                                  value && styles.checkboxChecked,
+                                ]}>
+                                  {value && (
+                                    <Text style={styles.checkboxCheckmark}>✓</Text>
+                                  )}
+                                </View>
+                              </View>
+                            );
+                          }
+                          
                           // Regular cell display
+                          const formatted = isNull ? '?' : formatCellValue(value, col.name);
+                          // Check if this is a date/timestamp column
+                          const isDateColumn = col.dataType && (
+                            col.dataType.toLowerCase().includes('date') ||
+                            col.dataType.toLowerCase().includes('time') ||
+                            col.dataType.toLowerCase().includes('timestamp')
+                          );
+                          // Check if it's a suffix-formatted number (object with number and suffix)
+                          if (typeof formatted === 'object' && formatted !== null && 'number' in formatted && 'suffix' in formatted) {
+                            return (
+                              <Text
+                                ref={(ref) => {
+                                  if (Platform.OS === 'web' && ref) {
+                                    const element = ref as any;
+                                    let domElement: HTMLElement | null = null;
+                                    if (element._nativeNode) {
+                                      domElement = element._nativeNode;
+                                    } else if (element.nodeType) {
+                                      domElement = element;
+                                    }
+                                    if (domElement) {
+                                      if (!textElementRefs.current.has(col.name)) {
+                                        textElementRefs.current.set(col.name, new Map());
+                                      }
+                                      textElementRefs.current.get(col.name)!.set(rowIndex, domElement);
+                                    }
+                                  }
+                                }}
+                                selectable={true}
+                                style={[
+                                  styles.tableCellText,
+                                  isNull && styles.nullValueText,
+                                ]}
+                                numberOfLines={1}
+                              >
+                                <Text selectable={true}>{formatted.number}</Text>
+                                <Text selectable={true} style={styles.numberSuffix}>{formatted.suffix}</Text>
+                              </Text>
+                            );
+                          }
                           return (
                             <Text
+                              ref={(ref) => {
+                                if (Platform.OS === 'web' && ref) {
+                                  const element = ref as any;
+                                  let domElement: HTMLElement | null = null;
+                                  if (element._nativeNode) {
+                                    domElement = element._nativeNode;
+                                  } else if (element.nodeType) {
+                                    domElement = element;
+                                  }
+                                  if (domElement) {
+                                    if (!textElementRefs.current.has(col.name)) {
+                                      textElementRefs.current.set(col.name, new Map());
+                                    }
+                                    textElementRefs.current.get(col.name)!.set(rowIndex, domElement);
+                                  }
+                                }
+                              }}
+                              selectable={true}
                               style={[
-                                styles.tableCellText,
+                                isDateColumn ? styles.tableCellTextDate : styles.tableCellText,
                                 isNull && styles.nullValueText,
                               ]}
                               numberOfLines={1}
                             >
-                              {isNull ? '?' : formatCellValue(value, col.name)}
+                              {formatted}
                             </Text>
                           );
                         })()}
@@ -1452,6 +1835,16 @@ export default function TableViewer({
                   </Text>
                 </TouchableOpacity>
               )}
+              <TouchableOpacity
+                style={styles.contextMenuItem}
+                onPress={() => {
+                  setFormatConfigColumn(contextMenuColumn);
+                  setContextMenuColumn(null);
+                  setShowFormatConfigModal(true);
+                }}
+              >
+                <Text style={styles.contextMenuText}>Configure Formatting...</Text>
+              </TouchableOpacity>
               <TouchableOpacity
                 style={styles.contextMenuItem}
                 onPress={() => {
@@ -2691,6 +3084,370 @@ export default function TableViewer({
           </TouchableOpacity>
         </Modal>
       )}
+
+      {/* Format Configuration Modal */}
+      {showFormatConfigModal && formatConfigColumn && (
+        <Modal
+          visible={showFormatConfigModal}
+          transparent={true}
+          animationType="fade"
+          onRequestClose={() => setShowFormatConfigModal(false)}
+        >
+          <TouchableOpacity
+            style={styles.modalOverlay}
+            activeOpacity={1}
+            onPress={() => setShowFormatConfigModal(false)}
+          >
+            <TouchableOpacity
+              activeOpacity={1}
+              onPress={() => {}}
+              style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}
+            >
+              <View style={styles.formatConfigModalContent}>
+                <View style={styles.formatConfigModalHeader}>
+                  <Text style={styles.formatConfigModalTitle}>
+                    Format: {formatConfigColumn}
+                  </Text>
+                  <TouchableOpacity
+                    onPress={() => setShowFormatConfigModal(false)}
+                    style={styles.modalCloseButton}
+                  >
+                    <Text style={styles.modalCloseText}>✕</Text>
+                  </TouchableOpacity>
+                </View>
+                <View style={styles.formatConfigModalPanels}>
+                  {/* Left Panel: Format Type Selection */}
+                  <View style={styles.formatConfigLeftPanel}>
+                    <Text style={styles.formatConfigPanelTitle}>Format Type</Text>
+                    <ScrollView style={styles.formatConfigPanelScroll}>
+                      {formatterRegistry.getAll()
+                        .filter((formatter) => formatter.type !== 'auto')
+                        .map((formatter) => (
+                          <TouchableOpacity
+                            key={formatter.type}
+                            style={[
+                              styles.formatConfigOption,
+                              formatConfigType === formatter.type && styles.formatConfigOptionSelected,
+                            ]}
+                            onPress={() => {
+                              setFormatConfigType(formatter.type);
+                              setFormatConfigOptions(formatter.getDefaultOptions());
+                            }}
+                          >
+                            <Text style={[
+                              styles.formatConfigOptionText,
+                              formatConfigType === formatter.type && styles.formatConfigOptionTextSelected,
+                            ]}>
+                              {formatter.displayName}
+                            </Text>
+                          </TouchableOpacity>
+                        ))}
+                    </ScrollView>
+                  </View>
+
+                  {/* Right Panel: Format Options */}
+                  <View style={styles.formatConfigRightPanel}>
+                    <Text style={styles.formatConfigPanelTitle}>Options</Text>
+                    <ScrollView style={styles.formatConfigPanelScroll}>
+                      {(() => {
+                        const formatter = formatterRegistry.get(formatConfigType);
+                        if (!formatter || formatConfigType === 'year' || formatConfigType === 'suffixes') {
+                          return (
+                            <View style={styles.formatConfigNoOptions}>
+                              <Text style={styles.formatConfigNoOptionsText}>
+                                No options available for this format type.
+                              </Text>
+                            </View>
+                          );
+                        }
+
+                        return (
+                          <>
+                            {/* Currency Symbol */}
+                            {formatConfigType === 'currency' && (
+                              <View style={styles.formatConfigSection}>
+                                <Text style={styles.formatConfigSectionTitle}>Currency Symbol</Text>
+                                <TextInput
+                                  style={styles.formatConfigInput}
+                                  value={formatConfigOptions.currencySymbol || '$'}
+                                  onChangeText={(text) => setFormatConfigOptions({ ...formatConfigOptions, currencySymbol: text })}
+                                  placeholder="$"
+                                />
+                              </View>
+                            )}
+
+                            {/* Date Format Options */}
+                            {formatConfigType === 'date' && (
+                              <>
+                                <View style={styles.formatConfigSection}>
+                                  <Text style={styles.formatConfigSectionTitle}>Date Format</Text>
+                                  {['M/D/Y', 'D/M/Y', 'Y-M-D', 'M-D-Y', 'D M Y', 'M D, Y'].map((format) => (
+                                    <TouchableOpacity
+                                      key={format}
+                                      style={[
+                                        styles.formatConfigOption,
+                                        formatConfigOptions.dateFormat === format && styles.formatConfigOptionSelected,
+                                      ]}
+                                      onPress={() => setFormatConfigOptions({ ...formatConfigOptions, dateFormat: format })}
+                                    >
+                                      <Text style={[
+                                        styles.formatConfigOptionText,
+                                        formatConfigOptions.dateFormat === format && styles.formatConfigOptionTextSelected,
+                                      ]}>
+                                        {format}
+                                      </Text>
+                                    </TouchableOpacity>
+                                  ))}
+                                </View>
+
+                                <View style={styles.formatConfigSection}>
+                                  <Text style={styles.formatConfigSectionTitle}>Time Format</Text>
+                                  <TouchableOpacity
+                                    style={[
+                                      styles.formatConfigOption,
+                                      formatConfigOptions.timeFormat === '12h' && styles.formatConfigOptionSelected,
+                                    ]}
+                                    onPress={() => setFormatConfigOptions({ ...formatConfigOptions, timeFormat: '12h' })}
+                                  >
+                                    <Text style={[
+                                      styles.formatConfigOptionText,
+                                      formatConfigOptions.timeFormat === '12h' && styles.formatConfigOptionTextSelected,
+                                    ]}>
+                                      12-hour (AM/PM)
+                                    </Text>
+                                  </TouchableOpacity>
+                                  <TouchableOpacity
+                                    style={[
+                                      styles.formatConfigOption,
+                                      formatConfigOptions.timeFormat === '24h' && styles.formatConfigOptionSelected,
+                                    ]}
+                                    onPress={() => setFormatConfigOptions({ ...formatConfigOptions, timeFormat: '24h' })}
+                                  >
+                                    <Text style={[
+                                      styles.formatConfigOptionText,
+                                      formatConfigOptions.timeFormat === '24h' && styles.formatConfigOptionTextSelected,
+                                    ]}>
+                                      24-hour
+                                    </Text>
+                                  </TouchableOpacity>
+                                </View>
+
+                                <View style={styles.formatConfigSection}>
+                                  <Text style={styles.formatConfigSectionTitle}>Show Time</Text>
+                                  <TouchableOpacity
+                                    style={styles.formatConfigToggle}
+                                    onPress={() => setFormatConfigOptions({ 
+                                      ...formatConfigOptions, 
+                                      showTime: !(formatConfigOptions.showTime !== false) 
+                                    })}
+                                  >
+                                    <Text style={styles.formatConfigToggleText}>
+                                      {(formatConfigOptions.showTime !== false) ? '✓ Enabled' : '○ Disabled'}
+                                    </Text>
+                                  </TouchableOpacity>
+                                </View>
+
+                                {(formatConfigOptions.showTime !== false) && (
+                                  <View style={styles.formatConfigSection}>
+                                    <Text style={styles.formatConfigSectionTitle}>Show Seconds</Text>
+                                    <TouchableOpacity
+                                      style={styles.formatConfigToggle}
+                                      onPress={() => setFormatConfigOptions({ 
+                                        ...formatConfigOptions, 
+                                        showSeconds: !(formatConfigOptions.showSeconds || false) 
+                                      })}
+                                    >
+                                      <Text style={styles.formatConfigToggleText}>
+                                        {(formatConfigOptions.showSeconds || false) ? '✓ Enabled' : '○ Disabled'}
+                                      </Text>
+                                    </TouchableOpacity>
+                                  </View>
+                                )}
+
+                                <View style={styles.formatConfigSection}>
+                                  <Text style={styles.formatConfigSectionTitle}>Timezone</Text>
+                                  <TouchableOpacity
+                                    style={[
+                                      styles.formatConfigOption,
+                                      (formatConfigOptions.timezone || 'local') === 'local' && styles.formatConfigOptionSelected,
+                                    ]}
+                                    onPress={() => setFormatConfigOptions({ ...formatConfigOptions, timezone: 'local' })}
+                                  >
+                                    <Text style={[
+                                      styles.formatConfigOptionText,
+                                      (formatConfigOptions.timezone || 'local') === 'local' && styles.formatConfigOptionTextSelected,
+                                    ]}>
+                                      Local
+                                    </Text>
+                                  </TouchableOpacity>
+                                  <TouchableOpacity
+                                    style={[
+                                      styles.formatConfigOption,
+                                      formatConfigOptions.timezone === 'utc' && styles.formatConfigOptionSelected,
+                                    ]}
+                                    onPress={() => setFormatConfigOptions({ ...formatConfigOptions, timezone: 'utc' })}
+                                  >
+                                    <Text style={[
+                                      styles.formatConfigOptionText,
+                                      formatConfigOptions.timezone === 'utc' && styles.formatConfigOptionTextSelected,
+                                    ]}>
+                                      UTC
+                                    </Text>
+                                  </TouchableOpacity>
+                                </View>
+                              </>
+                            )}
+
+                            {/* Decimal Places */}
+                            {(formatConfigType === 'currency' || formatConfigType === 'commas' || 
+                              formatConfigType === 'scientific' || formatConfigType === 'plain' ||
+                              formatConfigType === 'percent') && (
+                              <View style={styles.formatConfigSection}>
+                                <Text style={styles.formatConfigSectionTitle}>Decimal Places</Text>
+                                <TextInput
+                                  style={styles.formatConfigInput}
+                                  value={String(formatConfigOptions.decimalPlaces ?? formatter.getDefaultOptions().decimalPlaces ?? 2)}
+                                  onChangeText={(text) => {
+                                    const num = parseInt(text, 10);
+                                    if (!isNaN(num) && num >= 0 && num <= 20) {
+                                      setFormatConfigOptions({ ...formatConfigOptions, decimalPlaces: num });
+                                    }
+                                  }}
+                                  keyboardType="numeric"
+                                  placeholder="2"
+                                />
+                              </View>
+                            )}
+
+                            {/* Units Format Options */}
+                            {formatConfigType === 'units' && (
+                              <>
+                                <View style={styles.formatConfigSection}>
+                                  <Text style={styles.formatConfigSectionTitle}>Unit</Text>
+                                  <Text style={styles.formatConfigSectionSubtitle}>Common Units</Text>
+                                  <View style={styles.formatConfigUnitsGrid}>
+                                    {['ft', 'm', 'yd', 'in', 'mi', 'km', 'cm', 'mm', 'lbs', 'kg', 'oz', 'g', 'cups', 'ml', 'l', 'gal', 'pt', 'qt'].map((unit) => (
+                                      <TouchableOpacity
+                                        key={unit}
+                                        style={[
+                                          styles.formatConfigUnitButton,
+                                          formatConfigOptions.unit === unit && styles.formatConfigUnitButtonSelected,
+                                        ]}
+                                        onPress={() => setFormatConfigOptions({ ...formatConfigOptions, unit })}
+                                      >
+                                        <Text style={[
+                                          styles.formatConfigUnitButtonText,
+                                          formatConfigOptions.unit === unit && styles.formatConfigUnitButtonTextSelected,
+                                        ]}>
+                                          {unit}
+                                        </Text>
+                                      </TouchableOpacity>
+                                    ))}
+                                  </View>
+                                  <Text style={[styles.formatConfigSectionSubtitle, { marginTop: 16 }]}>Custom Unit</Text>
+                                  <TextInput
+                                    style={styles.formatConfigInput}
+                                    value={formatConfigOptions.unit || ''}
+                                    onChangeText={(text) => {
+                                      setFormatConfigOptions({ ...formatConfigOptions, unit: text });
+                                    }}
+                                    placeholder="Enter custom unit"
+                                  />
+                                </View>
+
+                                <View style={styles.formatConfigSection}>
+                                  <Text style={styles.formatConfigSectionTitle}>Decimal Places</Text>
+                                  <TextInput
+                                    style={styles.formatConfigInput}
+                                    value={String(formatConfigOptions.decimalPlaces ?? 0)}
+                                    onChangeText={(text) => {
+                                      const num = parseInt(text, 10);
+                                      if (!isNaN(num) && num >= 0 && num <= 20) {
+                                        setFormatConfigOptions({ ...formatConfigOptions, decimalPlaces: num });
+                                      }
+                                    }}
+                                    keyboardType="numeric"
+                                    placeholder="0"
+                                  />
+                                </View>
+
+                                <View style={styles.formatConfigSection}>
+                                  <Text style={styles.formatConfigSectionTitle}>Use Thousands Separator</Text>
+                                  <TouchableOpacity
+                                    style={styles.formatConfigToggle}
+                                    onPress={() => setFormatConfigOptions({ 
+                                      ...formatConfigOptions, 
+                                      useGrouping: !(formatConfigOptions.useGrouping ?? false) 
+                                    })}
+                                  >
+                                    <Text style={styles.formatConfigToggleText}>
+                                      {(formatConfigOptions.useGrouping ?? false) ? '✓ Enabled' : '○ Disabled'}
+                                    </Text>
+                                  </TouchableOpacity>
+                                </View>
+                              </>
+                            )}
+
+                            {/* Use Grouping (commas) */}
+                            {(formatConfigType === 'currency' || formatConfigType === 'commas') && (
+                              <View style={styles.formatConfigSection}>
+                                <Text style={styles.formatConfigSectionTitle}>Use Thousands Separator</Text>
+                                <TouchableOpacity
+                                  style={styles.formatConfigToggle}
+                                  onPress={() => setFormatConfigOptions({ 
+                                    ...formatConfigOptions, 
+                                    useGrouping: !(formatConfigOptions.useGrouping ?? true) 
+                                  })}
+                                >
+                                  <Text style={styles.formatConfigToggleText}>
+                                    {(formatConfigOptions.useGrouping ?? true) ? '✓ Enabled' : '○ Disabled'}
+                                  </Text>
+                                </TouchableOpacity>
+                              </View>
+                            )}
+                          </>
+                        );
+                      })()}
+                    </ScrollView>
+                  </View>
+                </View>
+                <View style={styles.formatConfigModalFooter}>
+                  <TouchableOpacity
+                    style={[styles.formatConfigButton, styles.formatConfigClearButton]}
+                    onPress={() => {
+                      const newConfigs = new Map(columnFormatConfigs);
+                      newConfigs.delete(formatConfigColumn);
+                      setColumnFormatConfigs(newConfigs);
+                      setShowFormatConfigModal(false);
+                    }}
+                  >
+                    <Text style={styles.formatConfigButtonText}>Clear</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.formatConfigButton, styles.formatConfigApplyButton]}
+                    onPress={() => {
+                      const newConfigs = new Map(columnFormatConfigs);
+                      const formatter = formatterRegistry.get(formatConfigType);
+                      const validatedOptions = formatter 
+                        ? formatter.validateOptions(formatConfigOptions)
+                        : formatConfigOptions;
+                      
+                      newConfigs.set(formatConfigColumn!, {
+                        type: formatConfigType,
+                        options: validatedOptions,
+                      });
+                      setColumnFormatConfigs(newConfigs);
+                      setShowFormatConfigModal(false);
+                    }}
+                  >
+                    <Text style={styles.formatConfigButtonText}>Apply</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </TouchableOpacity>
+          </TouchableOpacity>
+        </Modal>
+      )}
     </View>
   );
 }
@@ -2771,20 +3528,84 @@ const styles = StyleSheet.create({
     maxHeight: 36,
   },
   tableCell: {
-    padding: 12,
+    padding: 10,
     borderRightWidth: 1,
     borderRightColor: '#f0f0f0',
     justifyContent: 'center',
     maxHeight: 36,
+    overflow: 'visible',
   },
   tableCellText: {
     fontSize: 12,
     color: '#333',
     fontFamily: 'monospace',
+    includeFontPadding: false,
+  },
+  tableCellTextDate: {
+    fontSize: 11,
+    color: '#333',
+    fontFamily: 'monospace',
+    includeFontPadding: false,
   },
   nullValueText: {
     color: '#bbb',
     fontStyle: 'normal',
+  },
+  checkboxContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: '100%',
+    height: '100%',
+  },
+  checkbox: {
+    width: 18,
+    height: 18,
+    borderWidth: 2,
+    borderColor: '#ccc',
+    borderRadius: 3,
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  checkboxChecked: {
+    borderColor: '#667eea',
+    backgroundColor: '#667eea',
+  },
+  checkboxCheckmark: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: 'bold',
+  },
+  colorCellContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  colorDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#ccc',
+  },
+  urlLink: {
+    color: '#0066cc',
+    textDecorationLine: 'underline',
+  },
+  enumChip: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+    alignSelf: 'flex-start',
+  },
+  enumChipText: {
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  numberSuffix: {
+    paddingLeft: 3, // Half-space effect using padding
+    color: '#888',
   },
   emptyRow: {
     padding: 20,
@@ -3586,6 +4407,186 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 16,
     fontWeight: '600',
+  },
+  formatConfigModalContent: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    width: '95%',
+    maxWidth: 1500,
+    maxHeight: '85%',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 8,
+    overflow: 'hidden',
+    flexDirection: 'column',
+  },
+  formatConfigModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#e0e0e0',
+  },
+  formatConfigModalTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#333',
+    flex: 1,
+  },
+  formatConfigModalPanels: {
+    flexDirection: 'row',
+    flex: 1,
+    minHeight: 400,
+  },
+  formatConfigLeftPanel: {
+    flex: 0.35,
+    minWidth: 250,
+    borderRightWidth: 1,
+    borderRightColor: '#e0e0e0',
+    flexDirection: 'column',
+  },
+  formatConfigRightPanel: {
+    flex: 0.7,
+    minWidth: 300,
+    flexDirection: 'column',
+  },
+  formatConfigPanelTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#333',
+    padding: 16,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#e0e0e0',
+    backgroundColor: '#f8f9fa',
+  },
+  formatConfigPanelScroll: {
+    flex: 1,
+    padding: 16,
+  },
+  formatConfigModalFooter: {
+    flexDirection: 'row',
+    padding: 16,
+    borderTopWidth: 1,
+    borderTopColor: '#e0e0e0',
+    gap: 12,
+    justifyContent: 'flex-end',
+  },
+  formatConfigNoOptions: {
+    padding: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  formatConfigNoOptionsText: {
+    fontSize: 14,
+    color: '#999',
+    fontStyle: 'italic',
+  },
+  formatConfigSection: {
+    marginBottom: 24,
+  },
+  formatConfigSectionTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#333',
+    marginBottom: 12,
+  },
+  formatConfigSectionSubtitle: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#666',
+    marginBottom: 8,
+    marginTop: 4,
+  },
+  formatConfigUnitsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginBottom: 12,
+  },
+  formatConfigUnitButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 6,
+    backgroundColor: '#f5f5f5',
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+    minWidth: 50,
+    alignItems: 'center',
+  },
+  formatConfigUnitButtonSelected: {
+    backgroundColor: '#667eea',
+    borderColor: '#667eea',
+  },
+  formatConfigUnitButtonText: {
+    fontSize: 14,
+    color: '#333',
+    fontWeight: '500',
+  },
+  formatConfigUnitButtonTextSelected: {
+    color: '#fff',
+  },
+  formatConfigOption: {
+    padding: 12,
+    borderRadius: 6,
+    backgroundColor: '#f5f5f5',
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+  },
+  formatConfigOptionSelected: {
+    backgroundColor: '#667eea',
+    borderColor: '#667eea',
+  },
+  formatConfigOptionText: {
+    fontSize: 14,
+    color: '#333',
+  },
+  formatConfigOptionTextSelected: {
+    color: '#fff',
+    fontWeight: '500',
+  },
+  formatConfigInput: {
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 6,
+    padding: 12,
+    fontSize: 14,
+    backgroundColor: '#fff',
+  },
+  formatConfigToggle: {
+    padding: 12,
+    borderRadius: 6,
+    backgroundColor: '#f5f5f5',
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+  },
+  formatConfigToggleText: {
+    fontSize: 14,
+    color: '#333',
+  },
+  formatConfigButton: {
+    flex: 1,
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 6,
+    alignItems: 'center',
+  },
+  formatConfigClearButton: {
+    backgroundColor: '#f5f5f5',
+    borderWidth: 1,
+    borderColor: '#ddd',
+  },
+  formatConfigApplyButton: {
+    backgroundColor: '#667eea',
+  },
+  formatConfigButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#333',
   },
 });
 
