@@ -198,99 +198,99 @@ const connectToPglite: connectFn<PgliteConnectionInfo> = async ({name}: PgliteCo
     pgliteInstanceLock = instancePromise.catch(() => {}).then(() => {});
     
     try {
-        // Ensure resources are loaded before creating PGlite instance
-        await initializePgliteResources();
+    // Ensure resources are loaded before creating PGlite instance
+    await initializePgliteResources();
 
-        if (!pgliteModuleCache) {
-            throw new Error('PGlite module not loaded');
-        }
+    if (!pgliteModuleCache) {
+        throw new Error('PGlite module not loaded');
+    }
 
-        // Extract PGlite class from dynamically imported module
-        let PGlite: any = pgliteModuleCache.PGlite;
+    // Extract PGlite class from dynamically imported module
+    let PGlite: any = pgliteModuleCache.PGlite;
 
-        if (!PGlite && 'PGlite' in pgliteModuleCache) {
-            console.warn('[pglite] PGlite key exists but value is undefined/null');
-            try {
-                PGlite = pgliteModuleCache['PGlite'];
-            } catch (e) {
-                console.error('[pglite] Error accessing PGlite:', e);
-            }
-        }
-
-        if (!PGlite && pgliteModuleCache.default) {
-            if (typeof pgliteModuleCache.default === 'object') {
-                PGlite = pgliteModuleCache.default.PGlite;
-            } else if (typeof pgliteModuleCache.default === 'function') {
-                PGlite = pgliteModuleCache.default;
-            }
-        }
-
-        if (!PGlite) {
-            console.error('[pglite] PGlite module contents:', Object.keys(pgliteModuleCache));
-            throw new Error(`Failed to find PGlite in @electric-sql/pglite module. Available exports: ${Object.keys(pgliteModuleCache).join(', ')}`);
-        }
-
-        // Create PGlite instance with IndexedDB for persistent storage
-        // Metro is configured to serve PGlite's WASM and data files
-        let pgliteDb: any;
+    if (!PGlite && 'PGlite' in pgliteModuleCache) {
+        console.warn('[pglite] PGlite key exists but value is undefined/null');
         try {
-            console.log('[pglite] Creating PGlite instance with IndexedDB storage...');
-            // Use idb:// prefix for IndexedDB storage (persistent)
-            const PGliteCreate = PGlite.create || pgliteModuleCache.PGlite?.create || pgliteModuleCache.default?.create;
-            if (PGliteCreate) {
-                console.log('[pglite] Using PGlite.create()');
-                pgliteDb = await PGliteCreate(`idb://${name}`);
-            } else {
-                console.log('[pglite] Using PGlite constructor');
-                pgliteDb = new PGlite(`idb://${name}`);
-                await pgliteDb.waitReady;
-            }
-            console.log('[pglite] Successfully created PGlite with IndexedDB storage');
+            PGlite = pgliteModuleCache['PGlite'];
+        } catch (e) {
+            console.error('[pglite] Error accessing PGlite:', e);
+        }
+    }
+
+    if (!PGlite && pgliteModuleCache.default) {
+        if (typeof pgliteModuleCache.default === 'object') {
+            PGlite = pgliteModuleCache.default.PGlite;
+        } else if (typeof pgliteModuleCache.default === 'function') {
+            PGlite = pgliteModuleCache.default;
+        }
+    }
+
+    if (!PGlite) {
+        console.error('[pglite] PGlite module contents:', Object.keys(pgliteModuleCache));
+        throw new Error(`Failed to find PGlite in @electric-sql/pglite module. Available exports: ${Object.keys(pgliteModuleCache).join(', ')}`);
+    }
+
+    // Create PGlite instance with IndexedDB for persistent storage
+    // Metro is configured to serve PGlite's WASM and data files
+    let pgliteDb: any;
+    try {
+        console.log('[pglite] Creating PGlite instance with IndexedDB storage...');
+        // Use idb:// prefix for IndexedDB storage (persistent)
+        const PGliteCreate = PGlite.create || pgliteModuleCache.PGlite?.create || pgliteModuleCache.default?.create;
+        if (PGliteCreate) {
+            console.log('[pglite] Using PGlite.create()');
+            pgliteDb = await PGliteCreate(`idb://${name}`);
+        } else {
+            console.log('[pglite] Using PGlite constructor');
+            pgliteDb = new PGlite(`idb://${name}`);
+            await pgliteDb.waitReady;
+        }
+        console.log('[pglite] Successfully created PGlite with IndexedDB storage');
             
             // Ensure PGLite instance is fully ready before creating drizzle wrapper
             if (pgliteDb.waitReady) {
                 await pgliteDb.waitReady;
             }
-        } catch (error: any) {
-            console.error('[pglite] Error creating PGlite:', error);
-            console.error('[pglite] Error details:', {
-                name: error?.name,
-                message: error?.message,
-                errno: error?.errno,
-                stack: error?.stack
-            });
-            throw error;
-        }
-        
-        // Dynamic import to prevent Metro from analyzing
-        const { drizzle } = await import('drizzle-orm/pglite');
-        const db = drizzle(pgliteDb) as any;
-        db.raw = pgliteDb;
-        db.connInfo = {name, dialectName: 'pg', driverName: 'pglite'};
+    } catch (error: any) {
+        console.error('[pglite] Error creating PGlite:', error);
+        console.error('[pglite] Error details:', {
+            name: error?.name,
+            message: error?.message,
+            errno: error?.errno,
+            stack: error?.stack
+        });
+        throw error;
+    }
+
+    // Dynamic import to prevent Metro from analyzing
+    const { drizzle } = await import('drizzle-orm/pglite');
+    const db = drizzle(pgliteDb) as any;
+    db.raw = pgliteDb;
+    db.connInfo = {name, dialectName: 'pg', driverName: 'pglite'};
         // Explicitly set driverDetails properties to ensure they're set
         db.dialectName = driverDetails.dialectName;
         db.driverName = driverDetails.driverName;
-        Object.assign(db, driverDetails);
-        
-        // Normalize execute() to return consistent QueryResult format
-        // PGlite's execute() returns Results<T> = { rows: Row<T>[], affectedRows?: number, fields: { name: string, dataTypeID: number }[] }
-        const originalExecute = db.execute.bind(db);
-        db.execute = async (query: any) => {
-            try {
-                const result = await originalExecute(query);
-                // PGlite's Results type: { rows: Row<T>[], affectedRows?: number, fields: { name: string, dataTypeID: number }[] }
-                const columns: QueryResultColumn[] = result.fields?.map((field: { name: string; dataTypeID: number }) => ({
-                    name: field.name,
-                    dataType: field.dataTypeID?.toString(),
-                })) || [];
-                
-                return {
-                    rows: result.rows || [],
-                    columns: columns,
-                    rowCount: result.rows?.length || 0,
-                    affectedRows: result.affectedRows,
-                } as unknown as QueryResult;
-            } catch (error: any) {
+    Object.assign(db, driverDetails);
+    
+    // Normalize execute() to return consistent QueryResult format
+    // PGlite's execute() returns Results<T> = { rows: Row<T>[], affectedRows?: number, fields: { name: string, dataTypeID: number }[] }
+    const originalExecute = db.execute.bind(db);
+    db.execute = async (query: any) => {
+        try {
+            const result = await originalExecute(query);
+            // PGlite's Results type: { rows: Row<T>[], affectedRows?: number, fields: { name: string, dataTypeID: number }[] }
+            const columns: QueryResultColumn[] = result.fields?.map((field: { name: string; dataTypeID: number }) => ({
+                name: field.name,
+                dataType: field.dataTypeID?.toString(),
+            })) || [];
+            
+            return {
+                rows: result.rows || [],
+                columns: columns,
+                rowCount: result.rows?.length || 0,
+                affectedRows: result.affectedRows,
+            } as unknown as QueryResult;
+        } catch (error: any) {
             // Extract query details for debugging
             let queryStr = 'unknown';
             let params: any[] = [];

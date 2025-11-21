@@ -166,8 +166,8 @@ export async function extractRuntimeTableMetadata(
   
   // Update hasDefault and defaultValue for columns that have defaults in the database
   for (const colInfo of columns) {
-    const colName = colInfo.name;
-    if (metadata.columns[colName]) {
+      const colName = colInfo.name;
+      if (metadata.columns[colName]) {
       // Check if column has a default - handle both null/undefined and empty string
       // columnDefault can be a string (the default value) or null/undefined (no default)
       // PostgreSQL returns column_default as a string like 'CURRENT_TIMESTAMP'::timestamp without time zone

@@ -344,7 +344,7 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         rows: TableViewerRow[];
         totalRowCount: number;
     } | null>(null);
-    
+
     // Foreign key metadata
     const [foreignKeys, setForeignKeys] = useState<ForeignKeyInfo[]>([]);
     const [fkLookupConfig, setFKLookupConfig] = useState<FKLookupConfig>({});
@@ -1257,7 +1257,7 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
             
             // Queue the query execution to prevent concurrent WASM access
             const queryResult = await queueDbOperation(async () => {
-                // Execute query - result may be array of rows or object with rows/fields
+            // Execute query - result may be array of rows or object with rows/fields
                 return await db.execute(rawSql) as any;
             });
 
@@ -1342,8 +1342,8 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
                     };
                 }
                 return {
-                    name,
-                    label: name,
+                name,
+                label: name,
                 };
             });
 
@@ -1430,7 +1430,7 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
             lastExecutedQueryRef.current = queryText;
             // Delay execution to ensure DB is ready and avoid WASM conflicts
             const timeoutId = setTimeout(() => {
-                executeQuery();
+            executeQuery();
             }, 100);
             
             return () => clearTimeout(timeoutId);
@@ -1526,7 +1526,7 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
         // Add queryRows if non-zero
         if (finalQueryRows > 0) {
             searchParams.queryRows = String(finalQueryRows);
-        }
+                }
         
         return searchParams;
     }, [page, pageSize, sortBy, sortOrder, filterText, visibleColumns, columnOrder, columnWidths, queryText, initialQueryRows, queryResults, columnSeparator, tableName, generateDefaultQuery]);
@@ -1882,6 +1882,8 @@ export default function XpDeebyTableView({onNavigate}: { onNavigate: NavigateCal
                         onFKLookupConfigChange={handleFKLookupConfigChange}
                         onFKConfigColumnsRequest={handleFKConfigColumnsRequest}
                         onFKConfigReferencedTableFKsRequest={handleFKConfigReferencedTableFKsRequest}
+                        dbName={dbName}
+                        tableName={tableName}
                         onFKRecordRequest={async (fkColumn: string, fkValue: any, fk: ForeignKeyInfo) => {
                             if (!db) return null;
                             

@@ -20,8 +20,12 @@ import {
 } from 'react-native';
 import { useLocalSearchParams } from 'expo-router';
 import {connect, getRegistryEntries, getRegistryEntry, saveRegistryEntry, createOrRetrieveRegistryEntry} from '../xp-schema';
+import { sql } from '../xp-schema/xp-sql';
 import type { PostgresConnectionInfo } from '../xp-schema/xp-sql/drivers/connection-info-types';
 import * as DocumentPicker from 'expo-document-picker';
+import ExportModal from './ExportModal';
+import { exporterRegistry } from './exporters/exporter-registry';
+import type { ExportData } from './exporters/exporter.interface';
 
 export type NavigateCallback = (dbName: string | null, tableName: string | null, searchParams: Record<string, string>) => void;
 
@@ -142,6 +146,10 @@ export default function DatabaseBrowserLayout({
         materializedViews: false,
     });
     const loadingTableListRef = useRef(false);
+    
+    // Database export modal state
+    const [showExportModal, setShowExportModal] = useState(false);
+    const [exporting, setExporting] = useState(false);
 
     // Sync with URL param changes only on initial mount or when db changes
     const hasInitializedRef = useRef(false);
@@ -286,6 +294,116 @@ export default function DatabaseBrowserLayout({
             loadTableList();
         }
     }, [dbName, loadTableList]);
+
+    // Export handler
+    const handleExport = useCallback(async (format: string, selectedTables: string[], exportType: 'raw' | 'formatted') => {
+        if (Platform.OS !== 'web' || !dbName) return;
+        
+        setExporting(true);
+        try {
+            // Get database connection
+            const entries = await getRegistryEntries();
+            const entry = entries.find(e => e.name === dbName);
+            if (!entry) {
+                // @ts-ignore
+                alert('Database not found');
+                setExporting(false);
+                return;
+            }
+            
+            const db = await connect(entry);
+            const exporter = exporterRegistry.get(format);
+            if (!exporter) {
+                // @ts-ignore
+                alert(`Exporter for format "${format}" not found`);
+                setExporting(false);
+                return;
+            }
+
+            // Prepare export data for all selected tables
+            const tablesData = new Map<string, ExportData>();
+            
+            for (const tableName of selectedTables) {
+                try {
+                    const rows = await db.execute(sql.raw(`SELECT * FROM "${tableName}"`)) as any[];
+                    const columns = await db.getTableColumns(tableName);
+                    
+                    tablesData.set(tableName, {
+                        columns: columns.map(col => ({
+                            name: col.name,
+                            label: col.name,
+                            dataType: col.dataType,
+                            notNull: col.notNull,
+                            defaultValue: col.defaultValue,
+                        })),
+                        rows,
+                    });
+                } catch (err) {
+                    console.error(`Error loading table ${tableName}:`, err);
+                }
+            }
+
+            if (tablesData.size === 0) {
+                // @ts-ignore
+                alert('No tables to export');
+                setExporting(false);
+                return;
+            }
+
+            // Export using the exporter
+            const results = await exporter.exportTables(tablesData, {
+                formatted: exportType === 'formatted',
+            });
+
+            // Download files
+            const today = new Date().toISOString().split('T')[0];
+            const dbNamePart = dbName ? `${dbName}_` : '';
+
+            if (format === 'sqlite') {
+                // Single SQLite file
+                const result = results[0];
+                // @ts-ignore
+                const blob = new Blob([result.content], { type: result.mimeType });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `${dbNamePart}export_${today}.${result.extension}`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+                // @ts-ignore
+                alert(`Exported ${selectedTables.length} table(s) to SQLite database`);
+            } else {
+                // Multiple files (one per table)
+                for (let i = 0; i < results.length; i++) {
+                    const result = results[i];
+                    setTimeout(() => {
+                        // @ts-ignore
+                        const blob = new Blob([result.content], { type: result.mimeType });
+                        const url = URL.createObjectURL(blob);
+                        const link = document.createElement('a');
+                        link.href = url;
+                        link.download = `${dbNamePart}${result.fileName}_export_${today}.${result.extension}`;
+                        document.body.appendChild(link);
+                        link.click();
+                        document.body.removeChild(link);
+                        URL.revokeObjectURL(url);
+                    }, i * 200); // Stagger downloads
+                }
+                // @ts-ignore
+                alert(`Exporting ${results.length} table(s) as ${format.toUpperCase()} files...`);
+            }
+            
+            setShowExportModal(false);
+        } catch (err) {
+            console.error('Error exporting database:', err);
+            // @ts-ignore
+            alert(`Error exporting database: ${err instanceof Error ? err.message : String(err)}`);
+        } finally {
+            setExporting(false);
+        }
+    }, [dbName]);
 
     const handleDatabaseSelect = useCallback((selectedDbName: string) => {
         if (selectedDbName !== dbName) {
@@ -797,6 +915,21 @@ export default function DatabaseBrowserLayout({
                                 </>
                             )}
                         </ScrollView>
+                        
+                        {/* Export Database Button */}
+                        {dbName && Platform.OS === 'web' && (
+                            <View style={styles.exportSection}>
+                                <TouchableOpacity
+                                    style={styles.exportButton}
+                                    onPress={() => {
+                                        setShowExportModal(true);
+                                    }}
+                                >
+                                    <Text style={styles.exportButtonText}>📤 Export Database</Text>
+                                    <Text style={styles.exportButtonSubtext}>Select tables & format</Text>
+                                </TouchableOpacity>
+                            </View>
+                        )}
                     </View>
                 )}
 
@@ -807,6 +940,21 @@ export default function DatabaseBrowserLayout({
                     </View>
                 </SidebarContext.Provider>
             </View>
+
+            {/* Database Export Modal */}
+            {Platform.OS === 'web' && (
+                <ExportModal
+                    visible={showExportModal}
+                    onClose={() => setShowExportModal(false)}
+                    title={`Export Database: ${dbName}`}
+                    tables={tables}
+                    tableRowCounts={tableRowCounts}
+                    showTableSelection={true}
+                    availableFormats={['csv', 'markdown', 'json', 'sqlite']}
+                    onExport={handleExport}
+                    exporting={exporting}
+                />
+            )}
         </SafeAreaView>
     );
 }
@@ -1137,6 +1285,197 @@ const styles = StyleSheet.create({
         color: '#d32f2f',
         fontSize: 14,
         marginBottom: 12,
+    },
+    exportSection: {
+        borderTopWidth: 1,
+        borderTopColor: '#e0e0e0',
+        padding: 12,
+        backgroundColor: '#fafafa',
+        height: 58, // Match pagination bar height exactly (12px padding top + 12px padding bottom + 24px content = 48px)
+        justifyContent: 'center',
+        alignItems: 'center',
+    },
+    exportButton: {
+        backgroundColor: '#f5f5f5',
+        borderRadius: 4,
+        paddingHorizontal: 12,
+        paddingVertical: 6,
+        alignItems: 'center',
+        borderWidth: 1,
+        borderColor: '#e0e0e0',
+    },
+    exportButtonText: {
+        color: '#333',
+        fontSize: 12,
+        fontWeight: '600',
+        marginBottom: 2,
+    },
+    exportButtonSubtext: {
+        color: '#666',
+        fontSize: 10,
+    },
+    exportModalContent: {
+        backgroundColor: '#fff',
+        borderRadius: 12,
+        width: '90%',
+        maxWidth: 600,
+        maxHeight: '80%',
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.3,
+        shadowRadius: 8,
+        elevation: 8,
+    },
+    exportModalHeader: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: 16,
+        borderBottomWidth: 1,
+        borderBottomColor: '#e0e0e0',
+    },
+    exportModalTitle: {
+        fontSize: 18,
+        fontWeight: '600',
+        color: '#333',
+    },
+    modalCloseButton: {
+        width: 32,
+        height: 32,
+        borderRadius: 16,
+        backgroundColor: '#f5f5f5',
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    modalCloseText: {
+        fontSize: 18,
+        color: '#666',
+        fontWeight: 'bold',
+    },
+    exportModalBody: {
+        padding: 16,
+    },
+    exportModalDescription: {
+        fontSize: 14,
+        color: '#666',
+        marginBottom: 12,
+    },
+    exportFormatSelector: {
+        flexDirection: 'row',
+        gap: 8,
+        marginBottom: 20,
+    },
+    exportFormatButton: {
+        flex: 1,
+        paddingVertical: 10,
+        paddingHorizontal: 16,
+        borderRadius: 6,
+        borderWidth: 2,
+        borderColor: '#e0e0e0',
+        backgroundColor: '#fafafa',
+        alignItems: 'center',
+    },
+    exportFormatButtonSelected: {
+        borderColor: '#667eea',
+        backgroundColor: '#f0f4ff',
+    },
+    exportFormatButtonText: {
+        fontSize: 14,
+        fontWeight: '600',
+        color: '#666',
+    },
+    exportFormatButtonTextSelected: {
+        color: '#667eea',
+    },
+    exportTableSelector: {
+        maxHeight: 300,
+    },
+    exportSelectAllButton: {
+        paddingVertical: 8,
+        paddingHorizontal: 12,
+        borderRadius: 6,
+        backgroundColor: '#f5f5f5',
+        borderWidth: 1,
+        borderColor: '#e0e0e0',
+        marginBottom: 8,
+        alignItems: 'center',
+    },
+    exportSelectAllButtonText: {
+        fontSize: 13,
+        fontWeight: '600',
+        color: '#667eea',
+    },
+    exportTableList: {
+        maxHeight: 250,
+    },
+    exportTableItem: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        padding: 12,
+        borderRadius: 6,
+        borderWidth: 2,
+        borderColor: '#e0e0e0',
+        marginBottom: 8,
+        backgroundColor: '#fafafa',
+    },
+    exportTableItemSelected: {
+        borderColor: '#667eea',
+        backgroundColor: '#f0f4ff',
+    },
+    exportTableCheckbox: {
+        width: 20,
+        height: 20,
+        borderRadius: 4,
+        borderWidth: 2,
+        borderColor: '#ccc',
+        marginRight: 12,
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    exportTableCheckboxSelected: {
+        width: 10,
+        height: 10,
+        borderRadius: 2,
+        backgroundColor: '#667eea',
+    },
+    exportTableItemText: {
+        flex: 1,
+        fontSize: 14,
+        fontWeight: '500',
+        color: '#333',
+    },
+    exportTableItemCount: {
+        fontSize: 12,
+        color: '#666',
+        marginLeft: 8,
+    },
+    exportModalFooter: {
+        flexDirection: 'row',
+        justifyContent: 'flex-end',
+        gap: 12,
+        padding: 16,
+        borderTopWidth: 1,
+        borderTopColor: '#e0e0e0',
+    },
+    exportModalButton: {
+        paddingHorizontal: 20,
+        paddingVertical: 10,
+        borderRadius: 6,
+        minWidth: 120,
+        alignItems: 'center',
+    },
+    exportModalCancelButton: {
+        backgroundColor: '#f5f5f5',
+        borderWidth: 1,
+        borderColor: '#e0e0e0',
+    },
+    exportModalDownloadButton: {
+        backgroundColor: '#667eea',
+    },
+    exportModalButtonText: {
+        fontSize: 14,
+        fontWeight: '600',
+        color: '#333',
     },
 });
 

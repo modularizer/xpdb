@@ -323,9 +323,9 @@ async function getTableColumns(db: DrizzleDatabaseConnectionDriver, tableName: s
         }
         
         return {
-            name: row.name,
-            dataType: row.dataType || row.data_type || 'unknown',
-            isNullable: row.isNullable !== undefined ? row.isNullable : row.is_nullable === 'YES',
+        name: row.name,
+        dataType: row.dataType || row.data_type || 'unknown',
+        isNullable: row.isNullable !== undefined ? row.isNullable : row.is_nullable === 'YES',
             columnDefault: columnDefault,
         };
     });

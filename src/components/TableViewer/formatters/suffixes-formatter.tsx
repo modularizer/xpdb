@@ -1,4 +1,6 @@
-import { CellFormatter, FormatterOptions } from './formatter.interface';
+import React from 'react';
+import { Text } from 'react-native';
+import { CellFormatter, FormatterOptions, FormattedCellResult, CellRenderProps } from './formatter.interface';
 
 /**
  * Suffix notation formatter (k, M, B, T, etc.)
@@ -7,6 +9,36 @@ export class SuffixesFormatter implements CellFormatter {
   readonly type = 'suffixes';
   readonly displayName = 'Suffixes (k, M, B, etc.)';
   readonly description = 'Format large numbers with suffixes (k for thousands, M for millions, etc.)';
+
+  renderCell(props: CellRenderProps): FormattedCellResult {
+    const { value, options, styles, isNull } = props;
+    
+    if (isNull || value === null || value === undefined) {
+      return {
+        element: <Text style={[styles.tableCellText, styles.nullValueText]}>?</Text>,
+        stringValue: '',
+      };
+    }
+    
+    const formatted = this.format(value, options);
+    let stringValue: string;
+    let element: React.ReactNode;
+    
+    if (typeof formatted === 'object' && formatted !== null && 'number' in formatted && 'suffix' in formatted) {
+      stringValue = formatted.number + formatted.suffix;
+      element = (
+        <Text style={styles.tableCellText} selectable={true}>
+          <Text selectable={true}>{formatted.number}</Text>
+          <Text selectable={true} style={styles.numberSuffix}>{formatted.suffix}</Text>
+        </Text>
+      );
+    } else {
+      stringValue = String(formatted);
+      element = <Text style={styles.tableCellText} selectable={true}>{formatted}</Text>;
+    }
+    
+    return { element, stringValue };
+  }
 
   format(value: any, options?: FormatterOptions): string | { number: string; suffix: string } {
     if (value === null || value === undefined) return '';

@@ -1,3 +1,26 @@
+import React from 'react';
+import { StyleSheet } from 'react-native';
+
+/**
+ * Result from rendering a formatted cell
+ */
+export interface FormattedCellResult {
+  /** React element to display in the table */
+  element: React.ReactNode;
+  /** String representation for CSV export */
+  stringValue: string;
+}
+
+/**
+ * Props for rendering a cell
+ */
+export interface CellRenderProps {
+  value: any;
+  options?: FormatterOptions;
+  styles: ReturnType<typeof StyleSheet.create>;
+  isNull?: boolean;
+}
+
 /**
  * Interface for all cell formatters
  * Each formatter must implement this interface to be used in the table
@@ -13,7 +36,14 @@ export interface CellFormatter {
   readonly description: string;
   
   /**
-   * Format a value for display
+   * Render a cell with both React element and string representation
+   * @param props - Props for rendering the cell
+   * @returns Object with both the React element and string representation
+   */
+  renderCell(props: CellRenderProps): FormattedCellResult;
+  
+  /**
+   * Format a value for display (legacy method, kept for backward compatibility)
    * @param value - The value to format
    * @param options - Formatting options specific to this formatter
    * @returns Formatted string representation
@@ -68,10 +98,10 @@ export interface FormatterOptions {
 /**
  * Props for rendering formatter options UI
  */
-export interface FormatterOptionProps extends FormatterOptions {
-  setCurrencySymbol: (symbol: string) => void;
-  setDecimalPlaces: (places: number) => void;
-  setUseGrouping: (use: boolean) => void;
+export interface FormatterOptionProps {
+  options: FormatterOptions;
+  setOptions: (options: FormatterOptions) => void;
+  styles: ReturnType<typeof StyleSheet.create>;
 }
 
 /**

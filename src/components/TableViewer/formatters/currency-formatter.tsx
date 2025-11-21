@@ -1,4 +1,6 @@
-import { CellFormatter, FormatterOptions } from './formatter.interface';
+import React from 'react';
+import { Text } from 'react-native';
+import { CellFormatter, FormatterOptions, FormattedCellResult, CellRenderProps } from './formatter.interface';
 
 /**
  * Currency formatter
@@ -7,6 +9,25 @@ export class CurrencyFormatter implements CellFormatter {
   readonly type = 'currency';
   readonly displayName = 'Currency';
   readonly description = 'Format as currency with symbol and decimal places';
+
+  renderCell(props: CellRenderProps): FormattedCellResult {
+    const { value, options, styles, isNull } = props;
+    
+    if (isNull || value === null || value === undefined) {
+      return {
+        element: <Text style={[styles.tableCellText, styles.nullValueText]}>?</Text>,
+        stringValue: '',
+      };
+    }
+    
+    const formatted = this.format(value, options);
+    const stringValue = String(formatted);
+    
+    return {
+      element: <Text style={styles.tableCellText} selectable={true}>{formatted}</Text>,
+      stringValue,
+    };
+  }
 
   format(value: any, options?: FormatterOptions): string {
     if (value === null || value === undefined) return '';

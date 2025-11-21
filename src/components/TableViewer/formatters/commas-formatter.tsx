@@ -1,4 +1,6 @@
-import { CellFormatter, FormatterOptions } from './formatter.interface';
+import React from 'react';
+import { Text } from 'react-native';
+import { CellFormatter, FormatterOptions, FormattedCellResult, CellRenderProps } from './formatter.interface';
 
 /**
  * Commas formatter - numbers with thousands separator
@@ -7,6 +9,25 @@ export class CommasFormatter implements CellFormatter {
   readonly type = 'commas';
   readonly displayName = 'Commas (thousands separator)';
   readonly description = 'Format numbers with thousands separator (commas)';
+
+  renderCell(props: CellRenderProps): FormattedCellResult {
+    const { value, options, styles, isNull } = props;
+    
+    if (isNull || value === null || value === undefined) {
+      return {
+        element: <Text style={[styles.tableCellText, styles.nullValueText]}>?</Text>,
+        stringValue: '',
+      };
+    }
+    
+    const formatted = this.format(value, options);
+    const stringValue = String(formatted);
+    
+    return {
+      element: <Text style={styles.tableCellText} selectable={true}>{formatted}</Text>,
+      stringValue,
+    };
+  }
 
   format(value: any, options?: FormatterOptions): string {
     if (value === null || value === undefined) return '';

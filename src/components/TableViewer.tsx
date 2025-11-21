@@ -20,6 +20,9 @@ import { determineLookupColumn } from '../utils/fk-utils';
 import { formatterRegistry } from './TableViewer/formatters/formatter-registry';
 import { autoDetectFormatter } from './TableViewer/formatters/auto-formatter';
 import type { ColumnFormatConfig, FormatterOptions } from './TableViewer/formatters/formatter.interface';
+import ExportModal from './ExportModal';
+import { exporterRegistry } from './exporters/exporter-registry';
+import type { ExportData } from './exporters/exporter.interface';
 
 export interface TableViewerColumn {
   name: string;
@@ -147,6 +150,8 @@ export default function TableViewer({
   onNavigateToTable,
   focusedRowId = null,
   focusedColumnName = null,
+  dbName = null,
+  tableName = null,
 }: TableViewerProps) {
   const [showHiddenColumnsModal, setShowHiddenColumnsModal] = useState(false);
   const [contextMenuColumn, setContextMenuColumn] = useState<string | null>(null);
@@ -270,6 +275,9 @@ export default function TableViewer({
   const [formatConfigColumn, setFormatConfigColumn] = useState<string | null>(null);
   const [formatConfigType, setFormatConfigType] = useState<string>('auto');
   const [formatConfigOptions, setFormatConfigOptions] = useState<FormatterOptions>({});
+  
+  // CSV export modal
+  const [showCsvExportModal, setShowCsvExportModal] = useState(false);
   
   // Cascading FK selection state - tracks the path of FK selections
   type FKSelectionLevel = {
@@ -1221,17 +1229,191 @@ export default function TableViewer({
 
   const totalPages = Math.ceil(filteredTotalRowCount / pageSize);
   
-  // Get paginated rows
+  // Get paginated rows with formatted display strings
   const paginatedRows = useMemo(() => {
+    let sourceRows: TableViewerRow[];
     if (filterDisabled) {
       // When disabled, use original rows (pagination is handled server-side)
-      return rows;
+      sourceRows = rows;
+    } else {
+      // When enabled, paginate the filtered/sorted rows
+      const startIndex = (page - 1) * pageSize;
+      const endIndex = startIndex + pageSize;
+      sourceRows = filteredAndSortedRows.slice(startIndex, endIndex);
     }
-    // When enabled, paginate the filtered/sorted rows
-    const startIndex = (page - 1) * pageSize;
-    const endIndex = startIndex + pageSize;
-    return filteredAndSortedRows.slice(startIndex, endIndex);
-  }, [rows, filteredAndSortedRows, page, pageSize, filterDisabled]);
+    
+    // Add formatted display strings to each row using formatters
+    return sourceRows.map(row => {
+      const rowWithFormatted = { ...row };
+      // Add formatted strings for each column using formatter's renderCell
+      getOrderedVisibleColumns.forEach(col => {
+        const value = row[col.name];
+        const isNull = isValueNull(value);
+        
+        // Get the formatter for this column
+        const config = columnFormatConfigs.get(col.name);
+        const formatterType = config?.type || 'auto';
+        const formatter = formatterRegistry.get(formatterType);
+        
+        if (formatter && formatter.renderCell) {
+          // Use formatter's renderCell method
+          const result = formatter.renderCell({
+            value,
+            options: config?.options,
+            styles,
+            isNull,
+          });
+          // Store the string value for CSV export
+          (rowWithFormatted as any)[`__formatted_${col.name}`] = result.stringValue;
+        } else {
+          // Fallback to default formatting
+          const formatted = defaultFormatValue(value, col.name);
+          let stringValue: string;
+          if (typeof formatted === 'object' && formatted !== null && 'number' in formatted && 'suffix' in formatted) {
+            stringValue = formatted.number + formatted.suffix;
+          } else {
+            stringValue = String(formatted);
+          }
+          (rowWithFormatted as any)[`__formatted_${col.name}`] = stringValue;
+        }
+      });
+      return rowWithFormatted;
+    });
+  }, [rows, filteredAndSortedRows, page, pageSize, filterDisabled, getOrderedVisibleColumns, columnFormatConfigs, formatterRegistry, defaultFormatValue, isValueNull]);
+
+  // Export handler
+  const handleExport = useCallback(async (format: string, selectedTables: string[], exportType: 'raw' | 'formatted') => {
+    if (Platform.OS !== 'web') return;
+    
+    const exporter = exporterRegistry.get(format);
+    if (!exporter) {
+      // @ts-ignore
+      alert(`Exporter for format "${format}" not found`);
+      return;
+    }
+
+    const orderedVisibleCols = getOrderedVisibleColumns;
+    const rowsToExport = exportType === 'formatted' ? paginatedRows : filteredAndSortedRows;
+
+    // Helper function to get cell value as string
+    const getCellValue = (row: TableViewerRow, col: TableViewerColumn): string => {
+      let str: string;
+      
+      if (exportType === 'formatted') {
+        // Use formatted values
+        const formattedString = (row as any)[`__formatted_${col.name}`];
+        if (formattedString !== undefined) {
+          str = formattedString;
+        } else {
+          // Fallback: get the value and format it
+          let value = row[col.name];
+          
+          // For lookup columns, try to get from fkLookupData
+          if (value === undefined || value === null) {
+            const lookupMatch = col.name.match(/^(.+)->(.+)$/);
+            if (lookupMatch) {
+              const [, fkColumn] = lookupMatch;
+              const fkValue = row[fkColumn];
+              if (fkValue !== null && fkValue !== undefined) {
+                const lookupData = fkLookupData.get(col.name);
+                if (lookupData) {
+                  value = lookupData.get(fkValue);
+                }
+              }
+            }
+          }
+          
+          str = String(defaultFormatValue(value, col.name));
+        }
+      } else {
+        // Use raw values
+        let value = row[col.name];
+        
+        // For lookup columns, get the raw value
+        if (value === undefined || value === null) {
+          const lookupMatch = col.name.match(/^(.+)->(.+)$/);
+          if (lookupMatch) {
+            const [, fkColumn] = lookupMatch;
+            const fkValue = row[fkColumn];
+            if (fkValue !== null && fkValue !== undefined) {
+              const lookupData = fkLookupData.get(col.name);
+              if (lookupData) {
+                value = lookupData.get(fkValue);
+              }
+            }
+          }
+        }
+        
+        if (value === null || value === undefined) {
+          str = '';
+        } else if (typeof value === 'object') {
+          str = JSON.stringify(value);
+        } else {
+          str = String(value);
+        }
+      }
+      
+      return str;
+    };
+
+    // Prepare export data
+    const exportData: ExportData = {
+      columns: orderedVisibleCols.map(col => ({
+        name: col.name,
+        label: col.label || col.name,
+        dataType: col.dataType,
+      })),
+      rows: rowsToExport.map(row => {
+        const exportRow: Record<string, any> = {};
+        orderedVisibleCols.forEach(col => {
+          exportRow[col.name] = exportType === 'formatted' 
+            ? getCellValue(row, col)
+            : row[col.name];
+        });
+        return exportRow;
+      }),
+    };
+
+    // Export options
+    const exportOptions: ExportOptions = {
+      formatted: exportType === 'formatted',
+      formatValue: (value: any, column: string) => {
+        const col = orderedVisibleCols.find(c => c.name === column);
+        if (!col) return String(value);
+        return getCellValue({ [column]: value } as TableViewerRow, col);
+      },
+      lookupData: fkLookupData,
+    };
+
+    try {
+      const result = exporter.exportTable(exportData, tableName || 'table', exportOptions);
+      
+      // Generate filename
+      const today = new Date().toISOString().split('T')[0];
+      const dbNamePart = dbName ? `${dbName}_` : '';
+      const tableNamePart = tableName ? `${tableName}_` : '';
+      const exportTypeLabel = exportType === 'formatted' ? 'formatted' : 'raw';
+      const filename = `${dbNamePart}${tableNamePart}${exportTypeLabel}_${today}.${result.extension}`;
+      
+      // Download file
+      // @ts-ignore
+      const blob = new Blob([result.content], { type: result.mimeType });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      
+      setShowCsvExportModal(false);
+    } catch (err) {
+      // @ts-ignore
+      alert(`Error exporting: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [getOrderedVisibleColumns, paginatedRows, filteredAndSortedRows, tableName, dbName, fkLookupData, defaultFormatValue]);
 
   if (error) {
     return (
@@ -1633,8 +1815,49 @@ export default function TableViewer({
                             );
                           }
                           
-                          // Regular cell display
+                          // Regular cell display - use formatter's renderCell if available
+                          const config = columnFormatConfigs.get(col.name);
+                          const formatterType = config?.type || 'auto';
+                          const formatter = formatterRegistry.get(formatterType);
+                          
+                          if (formatter && formatter.renderCell) {
+                            // Use formatter's renderCell method
+                            const result = formatter.renderCell({
+                              value,
+                              options: config?.options,
+                              styles,
+                              isNull,
+                            });
+                            
+                            // Wrap the element with ref tracking for overflow detection
+                            return (
+                              <View
+                                ref={(ref) => {
+                                  if (Platform.OS === 'web' && ref) {
+                                    const element = ref as any;
+                                    let domElement: HTMLElement | null = null;
+                                    if (element._nativeNode) {
+                                      domElement = element._nativeNode;
+                                    } else if (element.nodeType) {
+                                      domElement = element;
+                                    }
+                                    if (domElement) {
+                                      if (!textElementRefs.current.has(col.name)) {
+                                        textElementRefs.current.set(col.name, new Map());
+                                      }
+                                      textElementRefs.current.get(col.name)!.set(rowIndex, domElement);
+                                    }
+                                  }
+                                }}
+                              >
+                                {result.element}
+                              </View>
+                            );
+                          }
+                          
+                          // Fallback to legacy formatting
                           const formatted = isNull ? '?' : formatCellValue(value, col.name);
+                          
                           // Check if this is a date/timestamp column
                           const isDateColumn = col.dataType && (
                             col.dataType.toLowerCase().includes('date') ||
@@ -1738,13 +1961,23 @@ export default function TableViewer({
               <Text style={styles.paginationWarning}> • Sorting and filtering disabled in paginated mode</Text>
             )}
           </Text>
-          <TouchableOpacity
-            style={[styles.paginationButton, page >= totalPages && styles.paginationButtonDisabled]}
-            onPress={() => onPageChange(page + 1)}
-            disabled={page >= totalPages}
-          >
-            <Text style={styles.paginationButtonText}>Next</Text>
-          </TouchableOpacity>
+          <View style={styles.paginationRight}>
+            {Platform.OS === 'web' && (
+              <TouchableOpacity
+                style={styles.csvDownloadIconButton}
+                onPress={() => setShowCsvExportModal(true)}
+              >
+                <Text style={styles.csvDownloadIconText}>⬇</Text>
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity
+              style={[styles.paginationButton, page >= totalPages && styles.paginationButtonDisabled]}
+              onPress={() => onPageChange(page + 1)}
+              disabled={page >= totalPages}
+            >
+              <Text style={styles.paginationButtonText}>Next</Text>
+            </TouchableOpacity>
+          </View>
         </View>
       </View>
 
@@ -2198,6 +2431,19 @@ export default function TableViewer({
           </TouchableOpacity>
         </TouchableOpacity>
       </Modal>
+
+      {/* Export Modal */}
+      {Platform.OS === 'web' && (
+        <ExportModal
+          visible={showCsvExportModal}
+          onClose={() => setShowCsvExportModal(false)}
+          title="Export Table"
+          tables={tableName ? [tableName] : []}
+          showTableSelection={false}
+          availableFormats={['csv', 'markdown', 'json']}
+          onExport={handleExport}
+        />
+      )}
 
       {/* FK Lookup Configuration Modal */}
       {showFKConfigModal && fkConfigColumn && fkLookupConfig[fkConfigColumn] && onFKLookupConfigChange && (
@@ -3625,6 +3871,23 @@ const styles = StyleSheet.create({
     borderTopColor: '#e0e0e0',
     backgroundColor: '#fafafa',
   },
+  paginationRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  csvDownloadIconButton: {
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    backgroundColor: '#f5f5f5',
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+  },
+  csvDownloadIconText: {
+    color: '#666',
+    fontSize: 16,
+  },
   paginationButton: {
     paddingHorizontal: 16,
     paddingVertical: 8,
@@ -4584,6 +4847,140 @@ const styles = StyleSheet.create({
     backgroundColor: '#667eea',
   },
   formatConfigButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#333',
+  },
+  csvExportModalContent: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    width: '90%',
+    maxWidth: 500,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  csvExportModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#e0e0e0',
+  },
+  csvExportModalTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#333',
+  },
+  csvExportModalBody: {
+    padding: 16,
+  },
+  csvExportModalDescription: {
+    fontSize: 14,
+    color: '#666',
+    marginBottom: 12,
+  },
+  csvExportFormatSelector: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 20,
+  },
+  csvExportFormatButton: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: '#e0e0e0',
+    backgroundColor: '#fafafa',
+    alignItems: 'center',
+  },
+  csvExportFormatButtonSelected: {
+    borderColor: '#667eea',
+    backgroundColor: '#f0f4ff',
+  },
+  csvExportFormatButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#666',
+  },
+  csvExportFormatButtonTextSelected: {
+    color: '#667eea',
+  },
+  csvExportOption: {
+    padding: 12,
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: '#e0e0e0',
+    marginBottom: 12,
+    backgroundColor: '#fafafa',
+  },
+  csvExportOptionSelected: {
+    borderColor: '#667eea',
+    backgroundColor: '#f0f4ff',
+  },
+  csvExportOptionContent: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  csvExportRadio: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: '#ccc',
+    marginRight: 12,
+    marginTop: 2,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  csvExportRadioSelected: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#667eea',
+  },
+  csvExportOptionText: {
+    flex: 1,
+  },
+  csvExportOptionTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#333',
+    marginBottom: 4,
+  },
+  csvExportOptionDescription: {
+    fontSize: 13,
+    color: '#666',
+    lineHeight: 18,
+  },
+  csvExportModalFooter: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 12,
+    padding: 16,
+    borderTopWidth: 1,
+    borderTopColor: '#e0e0e0',
+  },
+  csvExportButton: {
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 6,
+    minWidth: 100,
+    alignItems: 'center',
+  },
+  csvExportCancelButton: {
+    backgroundColor: '#f5f5f5',
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+  },
+  csvExportDownloadButton: {
+    backgroundColor: '#667eea',
+  },
+  csvExportButtonText: {
     fontSize: 14,
     fontWeight: '600',
     color: '#333',
