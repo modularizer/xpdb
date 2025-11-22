@@ -181,3 +181,4 @@ export function calculateOptimalColumnWidth(
   return constrainedWidth;
 }
 
+
